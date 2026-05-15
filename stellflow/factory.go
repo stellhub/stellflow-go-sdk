@@ -65,7 +65,7 @@ func (f *ClientFactory) NewAdmin() *admin.Client {
 
 // NewProducer creates a Producer client.
 func (f *ClientFactory) NewProducer() *producer.Client {
-	return producer.New(f.protocol, f.metadata)
+	return producer.NewWithOptions(f.protocol, f.metadata, f.options.Producer)
 }
 
 // NewConsumer creates a Consumer client.
