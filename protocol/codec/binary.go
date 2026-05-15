@@ -97,6 +97,14 @@ func (w *Writer) WriteBytes(value []byte) {
 	w.WriteRawBytes(value)
 }
 
+// WriteInt64Array writes an array of int64 values.
+func (w *Writer) WriteInt64Array(values []int64) {
+	w.WriteArrayLen(len(values))
+	for _, value := range values {
+		w.WriteInt64(value)
+	}
+}
+
 // WriteRawBytes writes bytes without a length prefix.
 func (w *Writer) WriteRawBytes(value []byte) {
 	w.bytes = append(w.bytes, value...)
@@ -260,6 +268,17 @@ func (r *Reader) ReadBytes() ([]byte, error) {
 	return value, nil
 }
 
+// ReadRawBytes reads bytes without a length prefix.
+func (r *Reader) ReadRawBytes(length int) ([]byte, error) {
+	if err := r.require(length); err != nil {
+		return nil, err
+	}
+	value := make([]byte, length)
+	copy(value, r.bytes[r.pos:r.pos+length])
+	r.pos += length
+	return value, nil
+}
+
 // ReadStringArray reads an array of non-null strings.
 func (r *Reader) ReadStringArray() ([]string, error) {
 	length, err := r.ReadArrayLen()
@@ -286,6 +305,23 @@ func (r *Reader) ReadInt32Array() ([]int32, error) {
 	values := make([]int32, 0, length)
 	for range length {
 		value, err := r.ReadInt32()
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+// ReadInt64Array reads an array of int64 values.
+func (r *Reader) ReadInt64Array() ([]int64, error) {
+	length, err := r.ReadArrayLen()
+	if err != nil {
+		return nil, err
+	}
+	values := make([]int64, 0, length)
+	for range length {
+		value, err := r.ReadInt64()
 		if err != nil {
 			return nil, err
 		}
