@@ -2,6 +2,7 @@ package codec
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/stellhub/stellflow-go-sdk/protocol"
 )
@@ -79,6 +80,27 @@ func (r *Registry) RegisterRequestEncoder(apiKey protocol.ApiKey, apiVersion int
 // RegisterResponseDecoder registers a response body decoder.
 func (r *Registry) RegisterResponseDecoder(apiKey protocol.ApiKey, apiVersion int16, decoder ResponseBodyDecoder) {
 	r.responseDecoders[codecKey{apiKey: apiKey, apiVersion: apiVersion}] = decoder
+}
+
+// SupportedVersions returns api versions that have both request and response codecs.
+func (r *Registry) SupportedVersions(apiKey protocol.ApiKey) []int16 {
+	requestVersions := make(map[int16]struct{})
+	for key := range r.requestEncoders {
+		if key.apiKey == apiKey {
+			requestVersions[key.apiVersion] = struct{}{}
+		}
+	}
+	var versions []int16
+	for key := range r.responseDecoders {
+		if key.apiKey != apiKey {
+			continue
+		}
+		if _, ok := requestVersions[key.apiVersion]; ok {
+			versions = append(versions, key.apiVersion)
+		}
+	}
+	sort.Slice(versions, func(i, j int) bool { return versions[i] < versions[j] })
+	return versions
 }
 
 // EncodeRequestBody encodes a request body with the registered codec.

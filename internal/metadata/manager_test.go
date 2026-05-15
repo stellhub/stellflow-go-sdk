@@ -85,6 +85,24 @@ func serveMetadataBroker(listener net.Listener, endpoint transport.Endpoint, don
 		done <- err
 		return
 	}
+	if apiKey != protocol.ApiKeyAPIVersions {
+		done <- &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected api versions request"}
+		return
+	}
+	if _, err := conn.Write(metadataAPIVersionsResponseFrame(correlationID)); err != nil {
+		done <- err
+		return
+	}
+	frame, err = transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		done <- err
+		return
+	}
+	apiKey, correlationID, err = metadataRequestHeader(frame)
+	if err != nil {
+		done <- err
+		return
+	}
 	if apiKey != protocol.ApiKeyMetadata {
 		done <- &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected metadata request"}
 		return
@@ -113,6 +131,32 @@ func metadataRequestHeader(frame []byte) (protocol.ApiKey, int32, error) {
 		return protocol.ApiKeyUnknown, 0, err
 	}
 	return protocol.ApiKeyFromCode(apiKeyCode), correlationID, nil
+}
+
+func metadataAPIVersionsResponseFrame(correlationID int32) []byte {
+	writer := codec.NewWriter()
+	writer.WriteInt32(correlationID)
+	writer.WriteInt16(protocol.DefaultHeaderVersion)
+	writer.WriteInt16(protocol.ErrorCodeNone.Code())
+	writer.WriteInt32(0)
+	writer.WriteArrayLen(2)
+	writer.WriteInt16(protocol.ApiKeyAPIVersions.Code())
+	writer.WriteInt16(0)
+	writer.WriteInt16(0)
+	writer.WriteInt16(protocol.ApiKeyMetadata.Code())
+	writer.WriteInt16(0)
+	writer.WriteInt16(0)
+	name := "stellflow-test-broker"
+	writer.WriteNullableString(&name)
+	writer.WriteNullableString(nil)
+	writer.WriteStringArray(nil)
+	payload, err := writer.Bytes()
+	if err != nil {
+		panic(err)
+	}
+	frame := make([]byte, 4, 4+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	return append(frame, payload...)
 }
 
 func metadataResponseFrame(correlationID int32, endpoint transport.Endpoint) []byte {

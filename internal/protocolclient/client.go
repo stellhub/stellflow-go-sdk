@@ -3,6 +3,7 @@ package protocolclient
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,11 @@ type Response struct {
 	Body   codec.ResponseBody
 }
 
+type apiVersionRange struct {
+	min int16
+	max int16
+}
+
 // RetryOptions configures request retry and backoff.
 type RetryOptions struct {
 	MaxAttempts    int
@@ -38,13 +44,15 @@ type Options struct {
 
 // Client sends Stellflow protocol requests through a transport pool.
 type Client struct {
-	pool     *transport.Pool
-	registry *codec.Registry
-	clientID string
-	options  Options
-	logger   observability.Logger
-	tracer   trace.Tracer
-	nextID   atomic.Int32
+	pool       *transport.Pool
+	registry   *codec.Registry
+	clientID   string
+	options    Options
+	logger     observability.Logger
+	tracer     trace.Tracer
+	nextID     atomic.Int32
+	versionsMu sync.RWMutex
+	versions   map[string]map[protocol.ApiKey]apiVersionRange
 }
 
 // New creates a protocol client.
@@ -66,11 +74,35 @@ func NewWithOptions(pool *transport.Pool, registry *codec.Registry, clientID str
 		options:  options,
 		logger:   obs.Logger,
 		tracer:   observability.Tracer(obs),
+		versions: make(map[string]map[protocol.ApiKey]apiVersionRange),
 	}
 }
 
 // Send encodes, sends, and decodes one request.
 func (c *Client) Send(ctx context.Context, endpoint transport.Endpoint, apiKey protocol.ApiKey, apiVersion int16, body codec.RequestBody) (Response, error) {
+	if c.pool == nil {
+		return Response{}, errors.New("protocol client requires transport pool")
+	}
+	selectedVersion, err := c.resolveAPIVersion(ctx, endpoint, apiKey, apiVersion)
+	if err != nil {
+		return Response{}, err
+	}
+	response, err := c.sendWithVersion(ctx, endpoint, apiKey, selectedVersion, body)
+	if err == nil || !protocol.IsUnsupportedVersion(err) || selectedVersion == protocol.DefaultAPIVersion {
+		return response, err
+	}
+	c.invalidateAPIVersions(endpoint)
+	c.logger.Warn(ctx, "falling back to default api version",
+		observability.String("endpoint", endpoint.Address()),
+		observability.Int16("api_key", apiKey.Code()),
+		observability.Int16("negotiated_version", selectedVersion),
+		observability.Int16("fallback_version", protocol.DefaultAPIVersion),
+		observability.Error(err),
+	)
+	return c.sendWithVersion(ctx, endpoint, apiKey, protocol.DefaultAPIVersion, body)
+}
+
+func (c *Client) sendWithVersion(ctx context.Context, endpoint transport.Endpoint, apiKey protocol.ApiKey, apiVersion int16, body codec.RequestBody) (Response, error) {
 	if c.pool == nil {
 		return Response{}, errors.New("protocol client requires transport pool")
 	}
@@ -178,12 +210,16 @@ func (c *Client) Send(ctx context.Context, endpoint transport.Endpoint, apiKey p
 
 // APIVersions sends ApiVersions to endpoint.
 func (c *Client) APIVersions(ctx context.Context, endpoint transport.Endpoint) (message.APIVersionsResponseBody, error) {
+	return c.fetchAPIVersions(ctx, endpoint)
+}
+
+func (c *Client) fetchAPIVersions(ctx context.Context, endpoint transport.Endpoint) (message.APIVersionsResponseBody, error) {
 	body := message.APIVersionsRequestBody{
 		ClientSoftwareName:    stringPtr("stellflow-go-sdk"),
 		ClientSoftwareVersion: stringPtr("0.0.1"),
 		SupportedFeatures:     []string{},
 	}
-	response, err := c.Send(ctx, endpoint, protocol.ApiKeyAPIVersions, protocol.DefaultAPIVersion, body)
+	response, err := c.sendWithVersion(ctx, endpoint, protocol.ApiKeyAPIVersions, protocol.DefaultAPIVersion, body)
 	if err != nil {
 		return message.APIVersionsResponseBody{}, err
 	}
@@ -191,6 +227,7 @@ func (c *Client) APIVersions(ctx context.Context, endpoint transport.Endpoint) (
 	if !ok {
 		return message.APIVersionsResponseBody{}, errors.New("unexpected ApiVersions response body")
 	}
+	c.cacheAPIVersions(endpoint, typed)
 	return typed, nil
 }
 
@@ -225,6 +262,73 @@ func stringPtr(value string) *string {
 	return &value
 }
 
+func (c *Client) resolveAPIVersion(ctx context.Context, endpoint transport.Endpoint, apiKey protocol.ApiKey, preferred int16) (int16, error) {
+	if apiKey == protocol.ApiKeyAPIVersions {
+		return preferred, nil
+	}
+	if version, ok := c.cachedAPIVersion(endpoint, apiKey); ok {
+		return version, nil
+	}
+	if _, err := c.fetchAPIVersions(ctx, endpoint); err != nil {
+		c.logger.Warn(ctx, "api version negotiation failed, using requested version",
+			observability.String("endpoint", endpoint.Address()),
+			observability.Int16("api_key", apiKey.Code()),
+			observability.Int16("requested_version", preferred),
+			observability.Error(err),
+		)
+		return preferred, nil
+	}
+	if version, ok := c.cachedAPIVersion(endpoint, apiKey); ok {
+		return version, nil
+	}
+	return preferred, nil
+}
+
+func (c *Client) cachedAPIVersion(endpoint transport.Endpoint, apiKey protocol.ApiKey) (int16, bool) {
+	c.versionsMu.RLock()
+	ranges := c.versions[endpoint.Address()]
+	c.versionsMu.RUnlock()
+	if len(ranges) == 0 {
+		return 0, false
+	}
+	versionRange, ok := ranges[apiKey]
+	if !ok {
+		return 0, false
+	}
+	return c.selectAPIVersion(apiKey, versionRange)
+}
+
+func (c *Client) selectAPIVersion(apiKey protocol.ApiKey, versionRange apiVersionRange) (int16, bool) {
+	versions := c.registry.SupportedVersions(apiKey)
+	for index := len(versions) - 1; index >= 0; index-- {
+		version := versions[index]
+		if version >= versionRange.min && version <= versionRange.max {
+			return version, true
+		}
+	}
+	return 0, false
+}
+
+func (c *Client) cacheAPIVersions(endpoint transport.Endpoint, body message.APIVersionsResponseBody) {
+	ranges := make(map[protocol.ApiKey]apiVersionRange, len(body.APIVersions))
+	for _, apiVersion := range body.APIVersions {
+		apiKey := protocol.ApiKeyFromCode(apiVersion.APIKey)
+		if apiKey == protocol.ApiKeyUnknown {
+			continue
+		}
+		ranges[apiKey] = apiVersionRange{min: apiVersion.MinVersion, max: apiVersion.MaxVersion}
+	}
+	c.versionsMu.Lock()
+	c.versions[endpoint.Address()] = ranges
+	c.versionsMu.Unlock()
+}
+
+func (c *Client) invalidateAPIVersions(endpoint transport.Endpoint) {
+	c.versionsMu.Lock()
+	delete(c.versions, endpoint.Address())
+	c.versionsMu.Unlock()
+}
+
 func normalizeOptions(options Options) Options {
 	if options.Retry.MaxAttempts == 0 {
 		options.Retry.MaxAttempts = 3
@@ -251,7 +355,11 @@ func (c *Client) canRetry(ctx context.Context, attempt int, err error) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	return protocol.IsRetriable(err) || isTransportRetryable(err)
+	var clientErr *protocol.ClientError
+	if errors.As(err, &clientErr) {
+		return protocol.IsRetriable(err)
+	}
+	return isTransportRetryable(err)
 }
 
 func (c *Client) backoff(ctx context.Context, attempt int) error {

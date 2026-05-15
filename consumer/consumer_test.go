@@ -148,6 +148,7 @@ func serveSubscribeBroker(t *testing.T, listener net.Listener, endpoint transpor
 	}
 
 	expected := []protocol.ApiKey{
+		protocol.ApiKeyAPIVersions,
 		protocol.ApiKeyFindCoordinator,
 		protocol.ApiKeyJoinGroup,
 		protocol.ApiKeySyncGroup,
@@ -217,6 +218,18 @@ func subscribeResponseFrame(correlationID int32, writeBody func(*codec.Writer)) 
 
 func writeSubscribeResponseBody(w *codec.Writer, apiKey protocol.ApiKey, endpoint transport.Endpoint) {
 	switch apiKey {
+	case protocol.ApiKeyAPIVersions:
+		w.WriteArrayLen(6)
+		writeAPIVersionRange(w, protocol.ApiKeyAPIVersions)
+		writeAPIVersionRange(w, protocol.ApiKeyFindCoordinator)
+		writeAPIVersionRange(w, protocol.ApiKeyJoinGroup)
+		writeAPIVersionRange(w, protocol.ApiKeySyncGroup)
+		writeAPIVersionRange(w, protocol.ApiKeyMetadata)
+		writeAPIVersionRange(w, protocol.ApiKeyOffsetFetch)
+		name := "stellflow-test-broker"
+		w.WriteNullableString(&name)
+		w.WriteNullableString(nil)
+		w.WriteStringArray(nil)
 	case protocol.ApiKeyFindCoordinator:
 		w.WriteInt16(protocol.ErrorCodeNone.Code())
 		w.WriteInt32(1)
@@ -268,4 +281,10 @@ func writeSubscribeResponseBody(w *codec.Writer, apiKey protocol.ApiKey, endpoin
 	default:
 		panic(fmt.Sprintf("unexpected api key %d", apiKey.Code()))
 	}
+}
+
+func writeAPIVersionRange(w *codec.Writer, apiKey protocol.ApiKey) {
+	w.WriteInt16(apiKey.Code())
+	w.WriteInt16(0)
+	w.WriteInt16(0)
 }

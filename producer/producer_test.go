@@ -224,6 +224,10 @@ func serveProducerBroker(t *testing.T, listener net.Listener, endpoint transport
 		done <- err
 		return
 	}
+	if err := expectProducerAPIVersionsRequest(conn); err != nil {
+		done <- err
+		return
+	}
 	metadataFrame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
 	if err != nil {
 		done <- err
@@ -283,6 +287,10 @@ func serveIdempotentProducerBroker(t *testing.T, listener net.Listener, endpoint
 		done <- err
 		return
 	}
+	if err := expectProducerAPIVersionsRequest(conn); err != nil {
+		done <- err
+		return
+	}
 	if err := expectMetadataRequest(conn, endpoint); err != nil {
 		done <- err
 		return
@@ -328,6 +336,10 @@ func serveTransactionBroker(t *testing.T, listener net.Listener, done chan<- err
 		done <- err
 		return
 	}
+	if err := expectProducerAPIVersionsRequest(conn); err != nil {
+		done <- err
+		return
+	}
 	if err := expectAPIKey(conn, protocol.ApiKeyInitProducerID, func(correlationID int32) []byte {
 		return initProducerIDResponseFrame(correlationID, 123, 2)
 	}); err != nil {
@@ -362,6 +374,22 @@ func expectAPIKey(conn net.Conn, want protocol.ApiKey, response func(int32) []by
 		return &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "unexpected api key"}
 	}
 	_, err = conn.Write(response(correlationID))
+	return err
+}
+
+func expectProducerAPIVersionsRequest(conn net.Conn) error {
+	frame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		return err
+	}
+	apiKey, correlationID, _, err := producerRequest(frame)
+	if err != nil {
+		return err
+	}
+	if apiKey != protocol.ApiKeyAPIVersions {
+		return &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected api versions request"}
+	}
+	_, err = conn.Write(producerAPIVersionsResponseFrame(correlationID))
 	return err
 }
 
@@ -572,6 +600,28 @@ func producerMetadataResponseFrame(correlationID int32, endpoint transport.Endpo
 		writer.WriteInt32(0)
 		writer.WriteInt32(0)
 	})
+}
+
+func producerAPIVersionsResponseFrame(correlationID int32) []byte {
+	return producerResponseFrame(correlationID, func(writer *codec.Writer) {
+		writer.WriteArrayLen(6)
+		writeProducerAPIVersionRange(writer, protocol.ApiKeyAPIVersions)
+		writeProducerAPIVersionRange(writer, protocol.ApiKeyMetadata)
+		writeProducerAPIVersionRange(writer, protocol.ApiKeyProduce)
+		writeProducerAPIVersionRange(writer, protocol.ApiKeyInitProducerID)
+		writeProducerAPIVersionRange(writer, protocol.ApiKeyBeginTxn)
+		writeProducerAPIVersionRange(writer, protocol.ApiKeyEndTxn)
+		name := "stellflow-test-broker"
+		writer.WriteNullableString(&name)
+		writer.WriteNullableString(nil)
+		writer.WriteStringArray(nil)
+	})
+}
+
+func writeProducerAPIVersionRange(writer *codec.Writer, apiKey protocol.ApiKey) {
+	writer.WriteInt16(apiKey.Code())
+	writer.WriteInt16(0)
+	writer.WriteInt16(0)
 }
 
 func initProducerIDResponseFrame(correlationID int32, producerID int64, producerEpoch int16) []byte {
