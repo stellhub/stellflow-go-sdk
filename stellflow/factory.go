@@ -41,7 +41,14 @@ func NewClientFactory(options Options) (*ClientFactory, error) {
 		endpoints = append(endpoints, endpoint)
 	}
 	pool := transport.NewPool(options.MaxFrameLength)
-	protocolClient := protocolclient.New(pool, codec.DefaultRegistry(), options.ClientID)
+	protocolClient := protocolclient.NewWithOptions(pool, codec.DefaultRegistry(), options.ClientID, protocolclient.Options{
+		RequestTimeout: options.RequestTimeout,
+		Retry: protocolclient.RetryOptions{
+			MaxAttempts:    options.Retry.MaxAttempts,
+			InitialBackoff: options.Retry.InitialBackoff,
+			MaxBackoff:     options.Retry.MaxBackoff,
+		},
+	})
 	metadataManager := imetadata.New(protocolClient, endpoints)
 	return &ClientFactory{
 		options:  options,

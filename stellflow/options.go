@@ -12,5 +12,13 @@ type Options struct {
 	ClientID         string
 	MaxFrameLength   int
 	RequestTimeout   time.Duration
+	Retry            RetryOptions
 	Consumer         consumer.Options
+}
+
+// RetryOptions configures request retry and backoff.
+type RetryOptions struct {
+	MaxAttempts    int
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
 }

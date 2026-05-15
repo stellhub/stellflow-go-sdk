@@ -43,8 +43,53 @@ func IsRetriable(err error) bool {
 	if !ok {
 		return false
 	}
+	return IsRetriableCode(clientErr.Code)
+}
+
+// IsRetriableCode reports whether an error code can be retried by default.
+func IsRetriableCode(code ErrorCode) bool {
+	switch code {
+	case ErrorCodeUnknownServerError,
+		ErrorCodeBrokerNotAvailable,
+		ErrorCodeLeaderNotAvailable,
+		ErrorCodeNotLeaderOrFollower,
+		ErrorCodeUnknownTopicOrPartition,
+		ErrorCodeCoordinatorNotAvailable,
+		ErrorCodeNotCoordinator,
+		ErrorCodeThrottled:
+		return true
+	default:
+		return false
+	}
+}
+
+// RequiresMetadataRefresh reports whether partition routing should be refreshed.
+func RequiresMetadataRefresh(err error) bool {
+	var clientErr *ClientError
+	ok := errors.As(err, &clientErr)
+	if !ok {
+		return false
+	}
 	switch clientErr.Code {
-	case ErrorCodeBrokerNotAvailable, ErrorCodeLeaderNotAvailable, ErrorCodeNotLeaderOrFollower, ErrorCodeCoordinatorNotAvailable, ErrorCodeNotCoordinator, ErrorCodeThrottled:
+	case ErrorCodeBrokerNotAvailable,
+		ErrorCodeLeaderNotAvailable,
+		ErrorCodeNotLeaderOrFollower,
+		ErrorCodeUnknownTopicOrPartition:
+		return true
+	default:
+		return false
+	}
+}
+
+// RequiresCoordinatorRefresh reports whether the group coordinator should be rediscovered.
+func RequiresCoordinatorRefresh(err error) bool {
+	var clientErr *ClientError
+	ok := errors.As(err, &clientErr)
+	if !ok {
+		return false
+	}
+	switch clientErr.Code {
+	case ErrorCodeCoordinatorNotAvailable, ErrorCodeNotCoordinator:
 		return true
 	default:
 		return false

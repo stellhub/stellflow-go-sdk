@@ -31,8 +31,12 @@ func (p *Pool) Get(ctx context.Context, endpoint Endpoint) (*Connection, error) 
 	for {
 		p.mu.Lock()
 		if conn := p.connections[key]; conn != nil {
-			p.mu.Unlock()
-			return conn, nil
+			if conn.IsClosed() {
+				delete(p.connections, key)
+			} else {
+				p.mu.Unlock()
+				return conn, nil
+			}
 		}
 		wait, ok := p.dialing[key]
 		if !ok {
@@ -66,6 +70,20 @@ func (p *Pool) Get(ctx context.Context, endpoint Endpoint) (*Connection, error) 
 	p.connections[key] = created
 	p.mu.Unlock()
 	return created, nil
+}
+
+// Invalidate removes a broken cached connection for endpoint.
+func (p *Pool) Invalidate(endpoint Endpoint, conn *Connection) {
+	key := endpoint.Address()
+	p.mu.Lock()
+	cached := p.connections[key]
+	if cached != nil && (conn == nil || cached == conn) {
+		delete(p.connections, key)
+	}
+	p.mu.Unlock()
+	if cached != nil && (conn == nil || cached == conn) {
+		_ = cached.Close()
+	}
 }
 
 // Close closes all cached connections.

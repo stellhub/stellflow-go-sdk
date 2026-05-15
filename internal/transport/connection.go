@@ -120,6 +120,16 @@ func (c *Connection) Close() error {
 	return err
 }
 
+// IsClosed reports whether the connection has been closed.
+func (c *Connection) IsClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Connection) readLoop() {
 	for {
 		frame, err := ReadFrame(c.conn, c.maxFrameLength)

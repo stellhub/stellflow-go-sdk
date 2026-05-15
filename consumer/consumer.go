@@ -15,6 +15,8 @@ import (
 	"github.com/stellhub/stellflow-go-sdk/protocol/message"
 )
 
+const routeRefreshAttempts = 2
+
 // TopicPartition identifies a manually assigned partition.
 type TopicPartition struct {
 	Topic     string
@@ -183,34 +185,65 @@ func (c *Client) Commit(ctx context.Context) error {
 	groupID := c.options.GroupID
 	metadata := c.options.CommitMetadata
 	for partition, offset := range consumedOffsets {
-		body := message.OffsetCommitRequestBody{
-			GroupID: &groupID,
-			Topics: []message.OffsetCommitTopic{
-				{
-					Topic: partition.Topic,
-					Partitions: []message.OffsetCommitPartition{
-						{Partition: partition.Partition, Offset: offset, Metadata: &metadata},
+		var lastErr error
+	attemptLoop:
+		for attempt := 1; attempt <= routeRefreshAttempts; attempt++ {
+			body := message.OffsetCommitRequestBody{
+				GroupID: &groupID,
+				Topics: []message.OffsetCommitTopic{
+					{
+						Topic: partition.Topic,
+						Partitions: []message.OffsetCommitPartition{
+							{Partition: partition.Partition, Offset: offset, Metadata: &metadata},
+						},
 					},
 				},
-			},
-		}
-		response, err := c.protocol.Send(ctx, coordinator, protocol.ApiKeyOffsetCommit, protocol.DefaultAPIVersion, body)
-		if err != nil {
-			return err
-		}
-		typed, ok := response.Body.(message.OffsetCommitResponseBody)
-		if !ok {
-			return errors.New("unexpected OffsetCommit response body")
-		}
-		for _, topic := range typed.Topics {
-			if topic.Topic == nil || *topic.Topic != partition.Topic {
-				continue
 			}
-			for _, part := range topic.Partitions {
-				if part.Partition == partition.Partition && part.ErrorCode != protocol.ErrorCodeNone {
-					return &protocol.ClientError{Code: part.ErrorCode, Message: "offset commit failed"}
+			response, err := c.protocol.Send(ctx, coordinator, protocol.ApiKeyOffsetCommit, protocol.DefaultAPIVersion, body)
+			if err != nil {
+				lastErr = err
+				if attempt < routeRefreshAttempts && c.shouldRefreshCoordinator(ctx, err) {
+					coordinator, err = c.refreshCoordinator(ctx)
+					if err != nil {
+						return lastErr
+					}
+					continue
+				}
+				return err
+			}
+			typed, ok := response.Body.(message.OffsetCommitResponseBody)
+			if !ok {
+				return errors.New("unexpected OffsetCommit response body")
+			}
+			for _, topic := range typed.Topics {
+				if topic.Topic == nil || *topic.Topic != partition.Topic {
+					continue
+				}
+				for _, part := range topic.Partitions {
+					if part.Partition != partition.Partition {
+						continue
+					}
+					if part.ErrorCode != protocol.ErrorCodeNone {
+						err := &protocol.ClientError{Code: part.ErrorCode, Message: "offset commit failed"}
+						lastErr = err
+						if attempt < routeRefreshAttempts && c.shouldRefreshCoordinator(ctx, err) {
+							var refreshErr error
+							coordinator, refreshErr = c.refreshCoordinator(ctx)
+							if refreshErr != nil {
+								return lastErr
+							}
+							continue attemptLoop
+						}
+						return err
+					}
+					lastErr = nil
+					break attemptLoop
 				}
 			}
+			lastErr = errors.New("offset commit response missing partition")
+		}
+		if lastErr != nil {
+			return lastErr
 		}
 	}
 	return nil
@@ -253,6 +286,19 @@ func (c *Client) coordinator(ctx context.Context) (transport.Endpoint, error) {
 		return session.Coordinator, nil
 	}
 	return c.findCoordinator(ctx, c.options.GroupID)
+}
+
+func (c *Client) refreshCoordinator(ctx context.Context) (transport.Endpoint, error) {
+	coordinator, err := c.findCoordinator(ctx, c.options.GroupID)
+	if err != nil {
+		return transport.Endpoint{}, err
+	}
+	c.mu.Lock()
+	if c.groupSession != nil {
+		c.groupSession.Coordinator = coordinator
+	}
+	c.mu.Unlock()
+	return coordinator, nil
 }
 
 func (c *Client) joinGroup(ctx context.Context, coordinator transport.Endpoint) (GroupSession, error) {
@@ -364,29 +410,52 @@ func (c *Client) fetchCommittedOffset(ctx context.Context, coordinator transport
 			{Topic: topic, Partitions: []message.OffsetFetchPartition{{Partition: partition}}},
 		},
 	}
-	response, err := c.protocol.Send(ctx, coordinator, protocol.ApiKeyOffsetFetch, protocol.DefaultAPIVersion, body)
-	if err != nil {
-		return 0, err
-	}
-	typed, ok := response.Body.(message.OffsetFetchResponseBody)
-	if !ok {
-		return 0, errors.New("unexpected OffsetFetch response body")
-	}
-	for _, topicResponse := range typed.Topics {
-		if topicResponse.Topic == nil || *topicResponse.Topic != topic {
-			continue
-		}
-		for _, partitionResponse := range topicResponse.Partitions {
-			if partitionResponse.Partition != partition {
+	var lastErr error
+attemptLoop:
+	for attempt := 1; attempt <= routeRefreshAttempts; attempt++ {
+		response, err := c.protocol.Send(ctx, coordinator, protocol.ApiKeyOffsetFetch, protocol.DefaultAPIVersion, body)
+		if err != nil {
+			lastErr = err
+			if attempt < routeRefreshAttempts && c.shouldRefreshCoordinator(ctx, err) {
+				coordinator, err = c.findCoordinator(ctx, c.options.GroupID)
+				if err != nil {
+					return 0, lastErr
+				}
 				continue
 			}
-			if partitionResponse.ErrorCode != protocol.ErrorCodeNone {
-				return 0, &protocol.ClientError{Code: partitionResponse.ErrorCode, Message: "offset fetch failed"}
-			}
-			return partitionResponse.Offset, nil
+			return 0, err
 		}
+		typed, ok := response.Body.(message.OffsetFetchResponseBody)
+		if !ok {
+			return 0, errors.New("unexpected OffsetFetch response body")
+		}
+		for _, topicResponse := range typed.Topics {
+			if topicResponse.Topic == nil || *topicResponse.Topic != topic {
+				continue
+			}
+			for _, partitionResponse := range topicResponse.Partitions {
+				if partitionResponse.Partition != partition {
+					continue
+				}
+				if partitionResponse.ErrorCode != protocol.ErrorCodeNone {
+					err := &protocol.ClientError{Code: partitionResponse.ErrorCode, Message: "offset fetch failed"}
+					lastErr = err
+					if attempt < routeRefreshAttempts && c.shouldRefreshCoordinator(ctx, err) {
+						var refreshErr error
+						coordinator, refreshErr = c.findCoordinator(ctx, c.options.GroupID)
+						if refreshErr != nil {
+							return 0, lastErr
+						}
+						continue attemptLoop
+					}
+					return 0, err
+				}
+				return partitionResponse.Offset, nil
+			}
+		}
+		lastErr = errors.New("offset fetch response missing partition")
 	}
-	return 0, errors.New("offset fetch response missing partition")
+	return 0, lastErr
 }
 
 func (c *Client) startHeartbeatLoop(session GroupSession) {
@@ -428,18 +497,41 @@ func (c *Client) heartbeat(ctx context.Context, session GroupSession) error {
 		GenerationID: session.GenerationID,
 		MemberID:     &memberID,
 	}
-	response, err := c.protocol.Send(ctx, session.Coordinator, protocol.ApiKeyHeartbeat, protocol.DefaultAPIVersion, body)
-	if err != nil {
-		return err
+	coordinator := session.Coordinator
+	var lastErr error
+	for attempt := 1; attempt <= routeRefreshAttempts; attempt++ {
+		response, err := c.protocol.Send(ctx, coordinator, protocol.ApiKeyHeartbeat, protocol.DefaultAPIVersion, body)
+		if err != nil {
+			lastErr = err
+			if attempt < routeRefreshAttempts && c.shouldRefreshCoordinator(ctx, err) {
+				coordinator, err = c.refreshCoordinator(ctx)
+				if err != nil {
+					return lastErr
+				}
+				continue
+			}
+			return err
+		}
+		typed, ok := response.Body.(message.HeartbeatResponseBody)
+		if !ok {
+			return errors.New("unexpected Heartbeat response body")
+		}
+		if typed.ErrorCode != protocol.ErrorCodeNone {
+			err := &protocol.ClientError{Code: typed.ErrorCode, Message: "heartbeat failed"}
+			lastErr = err
+			if attempt < routeRefreshAttempts && c.shouldRefreshCoordinator(ctx, err) {
+				var refreshErr error
+				coordinator, refreshErr = c.refreshCoordinator(ctx)
+				if refreshErr != nil {
+					return lastErr
+				}
+				continue
+			}
+			return err
+		}
+		return nil
 	}
-	typed, ok := response.Body.(message.HeartbeatResponseBody)
-	if !ok {
-		return errors.New("unexpected Heartbeat response body")
-	}
-	if typed.ErrorCode != protocol.ErrorCodeNone {
-		return &protocol.ClientError{Code: typed.ErrorCode, Message: "heartbeat failed"}
-	}
-	return nil
+	return lastErr
 }
 
 func (c *Client) fetchPartition(ctx context.Context, topic string, partition int32) ([]Record, error) {
@@ -447,41 +539,86 @@ func (c *Client) fetchPartition(ctx context.Context, topic string, partition int
 	c.mu.Lock()
 	fetchOffset := c.nextOffsets[key]
 	c.mu.Unlock()
-	route, err := c.metadata.Route(ctx, topic, partition)
-	if err != nil {
-		return nil, err
-	}
-	body := message.FetchRequestBody{
-		ReplicaID:      -1,
-		MaxWaitMs:      500,
-		MinBytes:       1,
-		MaxBytes:       c.options.FetchMaxBytes,
-		IsolationLevel: 0,
-		SessionID:      0,
-		TopicPartitions: []message.FetchTopicRequest{
-			{
-				Topic: topic,
-				Partitions: []message.FetchPartitionRequest{
-					{
-						Partition:          partition,
-						CurrentLeaderEpoch: route.LeaderEpoch,
-						FetchOffset:        fetchOffset,
-						LogStartOffset:     -1,
-						PartitionMaxBytes:  c.options.PartitionMaxBytes,
+	var lastErr error
+	for attempt := 1; attempt <= routeRefreshAttempts; attempt++ {
+		route, err := c.route(ctx, topic, partition, attempt)
+		if err != nil {
+			return nil, err
+		}
+		body := message.FetchRequestBody{
+			ReplicaID:      -1,
+			MaxWaitMs:      500,
+			MinBytes:       1,
+			MaxBytes:       c.options.FetchMaxBytes,
+			IsolationLevel: 0,
+			SessionID:      0,
+			TopicPartitions: []message.FetchTopicRequest{
+				{
+					Topic: topic,
+					Partitions: []message.FetchPartitionRequest{
+						{
+							Partition:          partition,
+							CurrentLeaderEpoch: route.LeaderEpoch,
+							FetchOffset:        fetchOffset,
+							LogStartOffset:     -1,
+							PartitionMaxBytes:  c.options.PartitionMaxBytes,
+						},
 					},
 				},
 			},
-		},
+		}
+		response, err := c.protocol.Send(ctx, route.Endpoint, protocol.ApiKeyFetch, protocol.DefaultAPIVersion, body)
+		if err != nil {
+			lastErr = err
+			if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
+				continue
+			}
+			return nil, err
+		}
+		typed, ok := response.Body.(message.FetchResponseBody)
+		if !ok {
+			return nil, errors.New("unexpected Fetch response body")
+		}
+		records, err := c.toRecords(topic, partition, fetchOffset, typed)
+		if err != nil {
+			lastErr = err
+			if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
+				continue
+			}
+			return nil, err
+		}
+		return records, nil
 	}
-	response, err := c.protocol.Send(ctx, route.Endpoint, protocol.ApiKeyFetch, protocol.DefaultAPIVersion, body)
-	if err != nil {
-		return nil, err
+	return nil, lastErr
+}
+
+func (c *Client) route(ctx context.Context, topic string, partition int32, attempt int) (imetadata.PartitionRoute, error) {
+	if attempt == 1 {
+		return c.metadata.Route(ctx, topic, partition)
 	}
-	typed, ok := response.Body.(message.FetchResponseBody)
-	if !ok {
-		return nil, errors.New("unexpected Fetch response body")
+	return c.metadata.RefreshRoute(ctx, topic, partition)
+}
+
+func shouldRefreshRoute(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
 	}
-	return c.toRecords(topic, partition, fetchOffset, typed)
+	if protocol.RequiresMetadataRefresh(err) {
+		return true
+	}
+	var clientErr *protocol.ClientError
+	return !errors.As(err, &clientErr)
+}
+
+func (c *Client) shouldRefreshCoordinator(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if protocol.RequiresCoordinatorRefresh(err) {
+		return true
+	}
+	var clientErr *protocol.ClientError
+	return !errors.As(err, &clientErr)
 }
 
 func (c *Client) toRecords(topic string, partition int32, fetchOffset int64, response message.FetchResponseBody) ([]Record, error) {

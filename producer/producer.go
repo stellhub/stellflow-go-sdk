@@ -14,6 +14,8 @@ import (
 
 const NoPartition int32 = -1
 
+const routeRefreshAttempts = 2
+
 // Record is one producer message.
 type Record struct {
 	Topic     string
@@ -61,71 +63,103 @@ func (c *Client) Send(ctx context.Context, record Record) (Metadata, error) {
 		}
 		partition = partitions[0]
 	}
-	route, err := c.metadata.Route(ctx, record.Topic, partition)
-	if err != nil {
-		return Metadata{}, err
-	}
-	now := time.Now().UnixMilli()
-	batchBytes, err := codec.EncodeRecordBatchSet([]message.RecordBatch{
-		{
-			PartitionLeaderEpoch: route.LeaderEpoch,
-			Magic:                message.RecordBatchMagicV1,
-			Attributes:           0,
-			LastOffsetDelta:      0,
-			BaseTimestamp:        now,
-			MaxTimestamp:         now,
-			ProducerID:           -1,
-			ProducerEpoch:        -1,
-			BaseSequence:         -1,
-			Records: []message.Record{
-				{
-					Attributes:     0,
-					TimestampDelta: 0,
-					OffsetDelta:    0,
-					Key:            record.Key,
-					Value:          record.Value,
-					Headers:        record.Headers,
+	var lastErr error
+attemptLoop:
+	for attempt := 1; attempt <= routeRefreshAttempts; attempt++ {
+		route, err := c.route(ctx, record.Topic, partition, attempt)
+		if err != nil {
+			return Metadata{}, err
+		}
+		now := time.Now().UnixMilli()
+		batchBytes, err := codec.EncodeRecordBatchSet([]message.RecordBatch{
+			{
+				PartitionLeaderEpoch: route.LeaderEpoch,
+				Magic:                message.RecordBatchMagicV1,
+				Attributes:           0,
+				LastOffsetDelta:      0,
+				BaseTimestamp:        now,
+				MaxTimestamp:         now,
+				ProducerID:           -1,
+				ProducerEpoch:        -1,
+				BaseSequence:         -1,
+				Records: []message.Record{
+					{
+						Attributes:     0,
+						TimestampDelta: 0,
+						OffsetDelta:    0,
+						Key:            record.Key,
+						Value:          record.Value,
+						Headers:        record.Headers,
+					},
 				},
 			},
-		},
-	})
-	if err != nil {
-		return Metadata{}, err
-	}
-	body := message.ProduceRequestBody{
-		Acks:      c.Acks,
-		TimeoutMs: c.Timeout,
-		TopicData: []message.ProduceTopicData{
-			{Topic: record.Topic, Partitions: []message.ProducePartitionData{{Partition: partition, Records: batchBytes}}},
-		},
-	}
-	response, err := c.protocol.Send(ctx, route.Endpoint, protocol.ApiKeyProduce, protocol.DefaultAPIVersion, body)
-	if err != nil {
-		return Metadata{}, err
-	}
-	typed, ok := response.Body.(message.ProduceResponseBody)
-	if !ok {
-		return Metadata{}, errors.New("unexpected Produce response body")
-	}
-	for _, topic := range typed.Responses {
-		if topic.Topic == nil || *topic.Topic != record.Topic {
-			continue
+		})
+		if err != nil {
+			return Metadata{}, err
 		}
-		for _, partitionResponse := range topic.Partitions {
-			if partitionResponse.Partition != partition {
+		body := message.ProduceRequestBody{
+			Acks:      c.Acks,
+			TimeoutMs: c.Timeout,
+			TopicData: []message.ProduceTopicData{
+				{Topic: record.Topic, Partitions: []message.ProducePartitionData{{Partition: partition, Records: batchBytes}}},
+			},
+		}
+		response, err := c.protocol.Send(ctx, route.Endpoint, protocol.ApiKeyProduce, protocol.DefaultAPIVersion, body)
+		if err != nil {
+			lastErr = err
+			if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
 				continue
 			}
-			if partitionResponse.ErrorCode != protocol.ErrorCodeNone {
-				return Metadata{}, &protocol.ClientError{Code: partitionResponse.ErrorCode, Message: "produce partition failed"}
-			}
-			return Metadata{
-				Topic:              record.Topic,
-				Partition:          partition,
-				Offset:             partitionResponse.BaseOffset,
-				CurrentLeaderEpoch: partitionResponse.CurrentLeaderEpoch,
-				LogStartOffset:     partitionResponse.LogStartOffset,
-			}, nil
+			return Metadata{}, err
 		}
+		typed, ok := response.Body.(message.ProduceResponseBody)
+		if !ok {
+			return Metadata{}, errors.New("unexpected Produce response body")
+		}
+		for _, topic := range typed.Responses {
+			if topic.Topic == nil || *topic.Topic != record.Topic {
+				continue
+			}
+			for _, partitionResponse := range topic.Partitions {
+				if partitionResponse.Partition != partition {
+					continue
+				}
+				if partitionResponse.ErrorCode != protocol.ErrorCodeNone {
+					err := &protocol.ClientError{Code: partitionResponse.ErrorCode, Message: "produce partition failed"}
+					lastErr = err
+					if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
+						continue attemptLoop
+					}
+					return Metadata{}, err
+				}
+				return Metadata{
+					Topic:              record.Topic,
+					Partition:          partition,
+					Offset:             partitionResponse.BaseOffset,
+					CurrentLeaderEpoch: partitionResponse.CurrentLeaderEpoch,
+					LogStartOffset:     partitionResponse.LogStartOffset,
+				}, nil
+			}
+		}
+		lastErr = errors.New("produce response missing partition result")
 	}
-	return Metadata{}, errors.New("produce response missing partition result")
+	return Metadata{}, lastErr
+}
+
+func (c *Client) route(ctx context.Context, topic string, partition int32, attempt int) (imetadata.PartitionRoute, error) {
+	if attempt == 1 {
+		return c.metadata.Route(ctx, topic, partition)
+	}
+	return c.metadata.RefreshRoute(ctx, topic, partition)
+}
+
+func shouldRefreshRoute(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if protocol.RequiresMetadataRefresh(err) {
+		return true
+	}
+	var clientErr *protocol.ClientError
+	return !errors.As(err, &clientErr)
 }

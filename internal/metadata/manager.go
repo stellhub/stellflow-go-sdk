@@ -57,14 +57,26 @@ func (m *Manager) BootstrapEndpoint() (transport.Endpoint, error) {
 
 // Refresh reloads metadata for topics.
 func (m *Manager) Refresh(ctx context.Context, topics []string) (message.MetadataResponseBody, error) {
-	bootstrap, err := m.BootstrapEndpoint()
-	if err != nil {
-		return message.MetadataResponseBody{}, err
+	if len(m.bootstrap) == 0 {
+		return message.MetadataResponseBody{}, fmt.Errorf("bootstrap endpoints must not be empty")
 	}
-	response, err := m.client.Metadata(ctx, bootstrap, topics)
-	if err != nil {
-		return message.MetadataResponseBody{}, err
+	var lastErr error
+	for _, endpoint := range m.bootstrap {
+		response, err := m.client.Metadata(ctx, endpoint, topics)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		m.update(response)
+		return response, nil
 	}
+	if lastErr != nil {
+		return message.MetadataResponseBody{}, lastErr
+	}
+	return message.MetadataResponseBody{}, fmt.Errorf("metadata refresh failed")
+}
+
+func (m *Manager) update(response message.MetadataResponseBody) {
 	brokers := make(map[int32]transport.Endpoint)
 	for _, broker := range response.Brokers {
 		if broker.Host == nil {
@@ -100,7 +112,6 @@ func (m *Manager) Refresh(ctx context.Context, topics []string) (message.Metadat
 	m.brokers = brokers
 	m.routes = routes
 	m.mu.Unlock()
-	return response, nil
 }
 
 // Route returns the cached leader route, refreshing metadata when absent.
@@ -118,6 +129,21 @@ func (m *Manager) Route(ctx context.Context, topic string, partition int32) (Par
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	route, ok = m.routes[key]
+	if !ok {
+		return PartitionRoute{}, fmt.Errorf("missing route for %s[%d]", topic, partition)
+	}
+	return route, nil
+}
+
+// RefreshRoute reloads metadata and returns the current leader route.
+func (m *Manager) RefreshRoute(ctx context.Context, topic string, partition int32) (PartitionRoute, error) {
+	if _, err := m.Refresh(ctx, []string{topic}); err != nil {
+		return PartitionRoute{}, err
+	}
+	key := TopicPartition{Topic: topic, Partition: partition}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	route, ok := m.routes[key]
 	if !ok {
 		return PartitionRoute{}, fmt.Errorf("missing route for %s[%d]", topic, partition)
 	}

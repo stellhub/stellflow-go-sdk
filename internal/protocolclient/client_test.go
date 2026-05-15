@@ -92,6 +92,70 @@ func TestClientCorrelatesOutOfOrderResponses(t *testing.T) {
 	}
 }
 
+func TestClientRetriesAfterConnectionDrop(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		firstConn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := transport.ReadFrame(firstConn, transport.DefaultMaxFrameLength); err != nil {
+			_ = firstConn.Close()
+			serverDone <- err
+			return
+		}
+		_ = firstConn.Close()
+
+		secondConn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer secondConn.Close()
+		second, err := transport.ReadFrame(secondConn, transport.DefaultMaxFrameLength)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		correlationID, err := requestCorrelationID(second)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := secondConn.Write(apiVersionsResponseFrame(correlationID)); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- nil
+	}()
+
+	endpoint, err := transport.ParseEndpoint(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseEndpoint() error = %v", err)
+	}
+	pool := transport.NewPool(transport.DefaultMaxFrameLength)
+	defer pool.Close()
+	client := protocolclient.NewWithOptions(pool, codec.DefaultRegistry(), "test-client", protocolclient.Options{
+		Retry: protocolclient.RetryOptions{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := client.APIVersions(ctx, endpoint); err != nil {
+		t.Fatalf("APIVersions() error = %v", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
 func requestCorrelationID(frame []byte) (int32, error) {
 	reader := codec.NewReader(frame)
 	if _, err := reader.ReadInt16(); err != nil {
