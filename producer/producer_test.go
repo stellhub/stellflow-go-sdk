@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -86,6 +87,21 @@ func TestKeyHashPartitionerIsStable(t *testing.T) {
 		if got != first {
 			t.Fatalf("partition = %d, want stable %d", got, first)
 		}
+	}
+}
+
+func TestProducerRejectsSendAfterClose(t *testing.T) {
+	client := NewWithOptions(nil, nil, Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := client.Send(ctx, Record{Topic: "orders", Value: []byte("a")}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Send() error = %v, want ErrClosed", err)
+	}
+	if _, err := client.SendAsync(ctx, Record{Topic: "orders", Value: []byte("a")}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("SendAsync() error = %v, want ErrClosed", err)
 	}
 }
 

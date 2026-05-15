@@ -11,14 +11,16 @@ type Partitioner func(record Record, partitions []int32) (int32, error)
 
 // Options configures producer batching and partitioning.
 type Options struct {
-	Acks          int16
-	TimeoutMs     int32
-	BatchSize     int
-	BatchBytes    int
-	Linger        time.Duration
-	QueueSize     int
-	Partitioner   Partitioner
-	Observability observability.Options
+	Acks            int16
+	TimeoutMs       int32
+	DeliveryTimeout time.Duration
+	MaxInFlight     int
+	BatchSize       int
+	BatchBytes      int
+	Linger          time.Duration
+	QueueSize       int
+	Partitioner     Partitioner
+	Observability   observability.Options
 }
 
 func normalizeOptions(options Options) Options {
@@ -27,6 +29,12 @@ func normalizeOptions(options Options) Options {
 	}
 	if options.TimeoutMs == 0 {
 		options.TimeoutMs = 30000
+	}
+	if options.DeliveryTimeout <= 0 {
+		options.DeliveryTimeout = 2 * time.Minute
+	}
+	if options.MaxInFlight <= 0 {
+		options.MaxInFlight = 5
 	}
 	if options.BatchSize <= 0 {
 		options.BatchSize = 100

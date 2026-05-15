@@ -15,6 +15,19 @@ import (
 	"github.com/stellhub/stellflow-go-sdk/protocol/codec"
 )
 
+type recordingRebalanceListener struct {
+	assigned [][]TopicPartition
+	revoked  [][]TopicPartition
+}
+
+func (l *recordingRebalanceListener) OnPartitionsAssigned(_ context.Context, partitions []TopicPartition) {
+	l.assigned = append(l.assigned, partitions)
+}
+
+func (l *recordingRebalanceListener) OnPartitionsRevoked(_ context.Context, partitions []TopicPartition) {
+	l.revoked = append(l.revoked, partitions)
+}
+
 func TestSubscribeJoinsGroupAndRestoresCommittedOffsets(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -33,10 +46,15 @@ func TestSubscribeJoinsGroupAndRestoresCommittedOffsets(t *testing.T) {
 	defer pool.Close()
 	protocolClient := protocolclient.New(pool, codec.DefaultRegistry(), "consumer-test")
 	metadataManager := imetadata.New(protocolClient, []transport.Endpoint{endpoint})
+	rbListener := &recordingRebalanceListener{}
 	client := New(protocolClient, metadataManager, Options{
-		GroupID:           "orders-group",
-		MemberID:          "member-a",
-		HeartbeatInterval: time.Hour,
+		GroupID:            "orders-group",
+		MemberID:           "member-a",
+		HeartbeatInterval:  time.Hour,
+		RebalanceListener:  rbListener,
+		EnableAutoCommit:   true,
+		AutoCommitInterval: time.Hour,
+		MaxPollInterval:    time.Hour,
 	})
 	defer client.Close()
 
@@ -61,9 +79,58 @@ func TestSubscribeJoinsGroupAndRestoresCommittedOffsets(t *testing.T) {
 	if len(client.assignment) != 1 || client.assignment[0].Topic != "orders" || client.assignment[0].Partition != 0 {
 		t.Fatalf("assignment = %+v, want orders[0]", client.assignment)
 	}
+	if len(rbListener.assigned) != 1 || len(rbListener.assigned[0]) != 1 {
+		t.Fatalf("assigned callbacks = %+v, want one partition", rbListener.assigned)
+	}
+	if len(rbListener.revoked) != 0 {
+		t.Fatalf("revoked callbacks = %+v, want none", rbListener.revoked)
+	}
 
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestAssignSeekPauseResume(t *testing.T) {
+	client := New(nil, nil, Options{})
+	if err := client.Assign([]TopicPartition{{Topic: "orders", Partition: 1, Offset: 10}}); err != nil {
+		t.Fatalf("Assign() error = %v", err)
+	}
+	if err := client.Seek("orders", 1, 42); err != nil {
+		t.Fatalf("Seek() error = %v", err)
+	}
+	key := imetadata.TopicPartition{Topic: "orders", Partition: 1}
+	client.mu.Lock()
+	if got := client.nextOffsets[key]; got != 42 {
+		client.mu.Unlock()
+		t.Fatalf("next offset = %d, want 42", got)
+	}
+	client.mu.Unlock()
+
+	client.Pause([]TopicPartition{{Topic: "orders", Partition: 1}})
+	client.mu.Lock()
+	_, paused := client.paused[key]
+	client.mu.Unlock()
+	if !paused {
+		t.Fatal("partition is not paused")
+	}
+
+	client.Resume([]TopicPartition{{Topic: "orders", Partition: 1}})
+	client.mu.Lock()
+	_, paused = client.paused[key]
+	client.mu.Unlock()
+	if paused {
+		t.Fatal("partition is still paused")
+	}
+}
+
+func TestSeekRejectsUnassignedPartition(t *testing.T) {
+	client := New(nil, nil, Options{})
+	if err := client.Assign([]TopicPartition{{Topic: "orders", Partition: 1, Offset: 10}}); err != nil {
+		t.Fatalf("Assign() error = %v", err)
+	}
+	if err := client.Seek("orders", 2, 42); err == nil {
+		t.Fatal("Seek() error = nil, want unassigned error")
 	}
 }
 

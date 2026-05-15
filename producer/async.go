@@ -86,7 +86,7 @@ func (c *Client) addAsyncRecord(batches map[batchKey]*producerBatch, item asyncR
 	batch.futures = append(batch.futures, item.future)
 	batch.bytes += estimateRecordBytes(item.record)
 	if len(batch.records) >= c.options.BatchSize || batch.bytes >= c.options.BatchBytes {
-		c.flushBatch(context.Background(), key, batch)
+		c.flushBatch(item.ctx, key, batch)
 		delete(batches, key)
 	}
 }

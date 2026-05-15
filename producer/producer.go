@@ -21,6 +21,9 @@ const NoPartition int32 = -1
 
 const routeRefreshAttempts = 2
 
+// ErrClosed is returned when producer methods are called after Close.
+var ErrClosed = errors.New("producer is closed")
+
 // Record is one producer message.
 type Record struct {
 	Topic     string
@@ -50,6 +53,8 @@ type Client struct {
 	Timeout    int32
 	mu         sync.Mutex
 	roundRobin int
+	closed     bool
+	inFlight   chan struct{}
 	workerOnce sync.Once
 	closeOnce  sync.Once
 	asyncCh    chan asyncRecord
@@ -75,6 +80,7 @@ func NewWithOptions(protocolClient *protocolclient.Client, metadataManager *imet
 		tracer:     observability.Tracer(obs),
 		Acks:       options.Acks,
 		Timeout:    options.TimeoutMs,
+		inFlight:   make(chan struct{}, options.MaxInFlight),
 		asyncCh:    make(chan asyncRecord, options.QueueSize),
 		flushCh:    make(chan flushRequest),
 		stopCh:     make(chan struct{}),
@@ -89,6 +95,10 @@ func (c *Client) Send(ctx context.Context, record Record) (Metadata, error) {
 		trace.WithAttributes(attribute.String("stellflow.topic", record.Topic)),
 	)
 	defer span.End()
+	if c.isClosed() {
+		c.recordError(ctx, span, "producer send failed", ErrClosed)
+		return Metadata{}, ErrClosed
+	}
 	if err := validateRecord(record); err != nil {
 		c.recordError(ctx, span, "producer record validation failed", err)
 		return Metadata{}, err
@@ -124,6 +134,10 @@ func (c *Client) SendAsync(ctx context.Context, record Record) (*Future, error) 
 		trace.WithAttributes(attribute.String("stellflow.topic", record.Topic)),
 	)
 	defer span.End()
+	if c.isClosed() {
+		c.recordError(ctx, span, "producer async enqueue failed", ErrClosed)
+		return nil, ErrClosed
+	}
 	if err := validateRecord(record); err != nil {
 		c.recordError(ctx, span, "producer async record validation failed", err)
 		return nil, err
@@ -148,6 +162,9 @@ func (c *Client) SendAsync(ctx context.Context, record Record) (*Future, error) 
 func (c *Client) Flush(ctx context.Context) error {
 	ctx, span := c.tracer.Start(ctx, "stellflow.producer.flush")
 	defer span.End()
+	if c.isClosed() {
+		return ErrClosed
+	}
 	c.ensureWorker()
 	request := flushRequest{ctx: ctx, done: make(chan error, 1)}
 	select {
@@ -175,6 +192,9 @@ func (c *Client) Close(ctx context.Context) error {
 	var closeErr error
 	c.closeOnce.Do(func() {
 		closeErr = c.Flush(ctx)
+		c.mu.Lock()
+		c.closed = true
+		c.mu.Unlock()
 		close(c.stopCh)
 		<-c.workerDone
 	})
@@ -211,6 +231,8 @@ func (c *Client) selectPartition(ctx context.Context, record Record) (int32, err
 }
 
 func (c *Client) produceRecords(ctx context.Context, topic string, partition int32, records []Record) ([]Metadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.options.DeliveryTimeout)
+	defer cancel()
 	ctx, span := c.tracer.Start(ctx, "stellflow.producer.produce_records",
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
@@ -245,7 +267,12 @@ attemptLoop:
 				{Topic: topic, Partitions: []message.ProducePartitionData{{Partition: partition, Records: batchBytes}}},
 			},
 		}
+		if err := c.acquireInFlight(ctx); err != nil {
+			c.recordError(ctx, span, "producer in-flight limit wait failed", err)
+			return nil, err
+		}
 		response, err := c.protocol.Send(ctx, route.Endpoint, protocol.ApiKeyProduce, protocol.DefaultAPIVersion, body)
+		c.releaseInFlight()
 		if err != nil {
 			lastErr = err
 			if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
@@ -322,6 +349,28 @@ func shouldRefreshRoute(ctx context.Context, err error) bool {
 	}
 	var clientErr *protocol.ClientError
 	return !errors.As(err, &clientErr)
+}
+
+func (c *Client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+func (c *Client) acquireInFlight(ctx context.Context) error {
+	select {
+	case c.inFlight <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) releaseInFlight() {
+	select {
+	case <-c.inFlight:
+	default:
+	}
 }
 
 func toProtocolRecords(records []Record) []message.Record {

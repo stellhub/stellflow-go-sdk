@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -20,6 +21,23 @@ import (
 )
 
 const routeRefreshAttempts = 2
+
+var (
+	// ErrNoOffset is returned when no committed offset exists and reset policy is none.
+	ErrNoOffset = errors.New("consumer offset is not committed")
+
+	// ErrMaxPollIntervalExceeded is returned when Poll is not called within MaxPollInterval.
+	ErrMaxPollIntervalExceeded = errors.New("consumer max poll interval exceeded")
+)
+
+// OffsetResetStrategy controls where consumption starts when no committed offset exists.
+type OffsetResetStrategy string
+
+const (
+	OffsetResetEarliest OffsetResetStrategy = "earliest"
+	OffsetResetLatest   OffsetResetStrategy = "latest"
+	OffsetResetNone     OffsetResetStrategy = "none"
+)
 
 // TopicPartition identifies a manually assigned partition.
 type TopicPartition struct {
@@ -39,31 +57,46 @@ type Record struct {
 	Timestamp int64
 }
 
+// RebalanceListener observes partition assignment changes.
+type RebalanceListener interface {
+	OnPartitionsRevoked(ctx context.Context, partitions []TopicPartition)
+	OnPartitionsAssigned(ctx context.Context, partitions []TopicPartition)
+}
+
 // Options configures a consumer.
 type Options struct {
-	GroupID           string
-	MemberID          string
-	SessionTimeout    time.Duration
-	HeartbeatInterval time.Duration
-	FetchMaxBytes     int32
-	PartitionMaxBytes int32
-	CommitMetadata    string
-	Observability     observability.Options
+	GroupID            string
+	MemberID           string
+	SessionTimeout     time.Duration
+	HeartbeatInterval  time.Duration
+	MaxPollInterval    time.Duration
+	FetchMaxBytes      int32
+	PartitionMaxBytes  int32
+	CommitMetadata     string
+	OffsetReset        OffsetResetStrategy
+	EnableAutoCommit   bool
+	AutoCommitInterval time.Duration
+	RebalanceListener  RebalanceListener
+	Observability      observability.Options
 }
 
 // Client fetches records from manually assigned partitions.
 type Client struct {
-	protocol        *protocolclient.Client
-	metadata        *imetadata.Manager
-	options         Options
-	logger          observability.Logger
-	tracer          trace.Tracer
-	assignment      []TopicPartition
-	nextOffsets     map[imetadata.TopicPartition]int64
-	consumedOffsets map[imetadata.TopicPartition]int64
-	mu              sync.Mutex
-	groupSession    *GroupSession
-	heartbeatCancel context.CancelFunc
+	protocol         *protocolclient.Client
+	metadata         *imetadata.Manager
+	options          Options
+	logger           observability.Logger
+	tracer           trace.Tracer
+	subscribedTopics []string
+	assignment       []TopicPartition
+	nextOffsets      map[imetadata.TopicPartition]int64
+	consumedOffsets  map[imetadata.TopicPartition]int64
+	paused           map[imetadata.TopicPartition]struct{}
+	lastPoll         time.Time
+	mu               sync.Mutex
+	groupSession     *GroupSession
+	heartbeatCancel  context.CancelFunc
+	autoCommitCancel context.CancelFunc
 }
 
 // GroupSession describes the active consumer group session.
@@ -89,6 +122,15 @@ func New(protocolClient *protocolclient.Client, metadataManager *imetadata.Manag
 	if options.HeartbeatInterval == 0 {
 		options.HeartbeatInterval = 3 * time.Second
 	}
+	if options.MaxPollInterval == 0 {
+		options.MaxPollInterval = 5 * time.Minute
+	}
+	if options.AutoCommitInterval == 0 {
+		options.AutoCommitInterval = 5 * time.Second
+	}
+	if options.OffsetReset == "" {
+		options.OffsetReset = OffsetResetLatest
+	}
 	if options.MemberID == "" {
 		options.MemberID = "stellflow-go-consumer"
 	}
@@ -101,6 +143,8 @@ func New(protocolClient *protocolclient.Client, metadataManager *imetadata.Manag
 		tracer:          observability.Tracer(obs),
 		nextOffsets:     make(map[imetadata.TopicPartition]int64),
 		consumedOffsets: make(map[imetadata.TopicPartition]int64),
+		paused:          make(map[imetadata.TopicPartition]struct{}),
+		lastPoll:        time.Now(),
 	}
 }
 
@@ -120,6 +164,22 @@ func (c *Client) Subscribe(ctx context.Context, topics []string) error {
 		c.recordError(ctx, span, "consumer subscribe failed", err)
 		return err
 	}
+	c.mu.Lock()
+	c.subscribedTopics = append([]string(nil), topics...)
+	c.lastPoll = time.Now()
+	c.mu.Unlock()
+	if err := c.joinSubscription(ctx, topics); err != nil {
+		c.recordError(ctx, span, "consumer subscribe failed", err)
+		return err
+	}
+	c.logger.Info(ctx, "consumer subscribed",
+		observability.String("group_id", c.options.GroupID),
+		observability.Int("topic_count", len(topics)),
+	)
+	return nil
+}
+
+func (c *Client) joinSubscription(ctx context.Context, topics []string) error {
 	coordinator, err := c.findCoordinator(ctx, c.options.GroupID)
 	if err != nil {
 		return err
@@ -142,10 +202,7 @@ func (c *Client) Subscribe(ctx context.Context, topics []string) error {
 	c.groupSession = &session
 	c.mu.Unlock()
 	c.startHeartbeatLoop(session)
-	c.logger.Info(ctx, "consumer subscribed",
-		observability.String("group_id", c.options.GroupID),
-		observability.Int("partition_count", len(assignment)),
-	)
+	c.startAutoCommitLoop()
 	return nil
 }
 
@@ -155,16 +212,50 @@ func (c *Client) Assign(partitions []TopicPartition) error {
 		return errors.New("partitions must not be empty")
 	}
 	c.stopHeartbeatLoop()
+	c.stopAutoCommitLoop()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.groupSession = nil
+	c.subscribedTopics = nil
 	c.assignment = append([]TopicPartition(nil), partitions...)
 	c.nextOffsets = make(map[imetadata.TopicPartition]int64, len(partitions))
 	c.consumedOffsets = make(map[imetadata.TopicPartition]int64)
+	c.paused = make(map[imetadata.TopicPartition]struct{})
 	for _, partition := range partitions {
 		c.nextOffsets[imetadata.TopicPartition{Topic: partition.Topic, Partition: partition.Partition}] = partition.Offset
 	}
 	return nil
+}
+
+// Seek changes the next fetch offset for an assigned partition.
+func (c *Client) Seek(topic string, partition int32, offset int64) error {
+	key := imetadata.TopicPartition{Topic: topic, Partition: partition}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.isAssignedLocked(key) {
+		return fmt.Errorf("partition is not assigned: %s[%d]", topic, partition)
+	}
+	c.nextOffsets[key] = offset
+	delete(c.consumedOffsets, key)
+	return nil
+}
+
+// Pause stops Poll from fetching the specified partitions.
+func (c *Client) Pause(partitions []TopicPartition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, partition := range partitions {
+		c.paused[imetadata.TopicPartition{Topic: partition.Topic, Partition: partition.Partition}] = struct{}{}
+	}
+}
+
+// Resume allows Poll to fetch the specified paused partitions again.
+func (c *Client) Resume(partitions []TopicPartition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, partition := range partitions {
+		delete(c.paused, imetadata.TopicPartition{Topic: partition.Topic, Partition: partition.Partition})
+	}
 }
 
 // Poll fetches from assigned partitions.
@@ -172,15 +263,37 @@ func (c *Client) Poll(ctx context.Context) ([]Record, error) {
 	ctx, span := c.tracer.Start(ctx, "stellflow.consumer.poll")
 	defer span.End()
 	c.mu.Lock()
+	if time.Since(c.lastPoll) > c.options.MaxPollInterval {
+		c.mu.Unlock()
+		err := ErrMaxPollIntervalExceeded
+		c.recordError(ctx, span, "consumer max poll interval exceeded", err)
+		if rejoinErr := c.rejoin(ctx); rejoinErr != nil {
+			return nil, rejoinErr
+		}
+		return nil, err
+	}
+	c.lastPoll = time.Now()
 	assignment := append([]TopicPartition(nil), c.assignment...)
+	paused := make(map[imetadata.TopicPartition]struct{}, len(c.paused))
+	for key := range c.paused {
+		paused[key] = struct{}{}
+	}
 	c.mu.Unlock()
 	if len(assignment) == 0 {
 		return nil, nil
 	}
 	var records []Record
 	for _, partition := range assignment {
+		if _, ok := paused[imetadata.TopicPartition{Topic: partition.Topic, Partition: partition.Partition}]; ok {
+			continue
+		}
 		fetched, err := c.fetchPartition(ctx, partition.Topic, partition.Partition)
 		if err != nil {
+			if c.shouldRejoin(ctx, err) {
+				if rejoinErr := c.rejoin(ctx); rejoinErr != nil {
+					return nil, rejoinErr
+				}
+			}
 			c.recordError(ctx, span, "consumer poll failed", err)
 			return nil, err
 		}
@@ -287,6 +400,7 @@ func (c *Client) Commit(ctx context.Context) error {
 // Close stops background group work. It does not close the shared factory transport.
 func (c *Client) Close() error {
 	c.stopHeartbeatLoop()
+	c.stopAutoCommitLoop()
 	return nil
 }
 
@@ -424,16 +538,26 @@ func (c *Client) assignWithOffsets(ctx context.Context, coordinator transport.En
 			return err
 		}
 		if offset < 0 {
-			offset = 0
+			offset, err = c.resetOffset(ctx, partition.Topic, partition.Partition)
+			if err != nil {
+				return err
+			}
 		}
 		key := imetadata.TopicPartition{Topic: partition.Topic, Partition: partition.Partition}
 		nextOffsets[key] = offset
 	}
 	c.mu.Lock()
+	revoked := diffAssignments(c.assignment, assignment)
+	assigned := diffAssignments(assignment, c.assignment)
+	c.mu.Unlock()
+	c.notifyPartitionsRevoked(ctx, revoked)
+	c.mu.Lock()
 	c.assignment = append([]TopicPartition(nil), assignment...)
 	c.nextOffsets = nextOffsets
 	c.consumedOffsets = make(map[imetadata.TopicPartition]int64)
+	c.paused = keepPaused(c.paused, assignment)
 	c.mu.Unlock()
+	c.notifyPartitionsAssigned(ctx, assigned)
 	return nil
 }
 
@@ -493,6 +617,80 @@ attemptLoop:
 	return 0, lastErr
 }
 
+func (c *Client) resetOffset(ctx context.Context, topic string, partition int32) (int64, error) {
+	switch c.options.OffsetReset {
+	case OffsetResetEarliest:
+		return c.listOffset(ctx, topic, partition, message.ListOffsetsEarliestTimestamp)
+	case OffsetResetLatest:
+		return c.listOffset(ctx, topic, partition, message.ListOffsetsLatestTimestamp)
+	case OffsetResetNone:
+		return 0, ErrNoOffset
+	default:
+		return 0, fmt.Errorf("unsupported offset reset strategy: %s", c.options.OffsetReset)
+	}
+}
+
+func (c *Client) listOffset(ctx context.Context, topic string, partition int32, timestamp int64) (int64, error) {
+	var lastErr error
+attemptLoop:
+	for attempt := 1; attempt <= routeRefreshAttempts; attempt++ {
+		route, err := c.route(ctx, topic, partition, attempt)
+		if err != nil {
+			return 0, err
+		}
+		body := message.ListOffsetsRequestBody{
+			ReplicaID:      -1,
+			IsolationLevel: 0,
+			Topics: []message.ListOffsetsTopicRequest{
+				{
+					Topic: topic,
+					Partitions: []message.ListOffsetsPartitionRequest{
+						{
+							Partition:          partition,
+							CurrentLeaderEpoch: route.LeaderEpoch,
+							Timestamp:          timestamp,
+							MaxNumOffsets:      1,
+						},
+					},
+				},
+			},
+		}
+		response, err := c.protocol.Send(ctx, route.Endpoint, protocol.ApiKeyListOffsets, protocol.DefaultAPIVersion, body)
+		if err != nil {
+			lastErr = err
+			if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
+				continue
+			}
+			return 0, err
+		}
+		typed, ok := response.Body.(message.ListOffsetsResponseBody)
+		if !ok {
+			return 0, errors.New("unexpected ListOffsets response body")
+		}
+		for _, topicResponse := range typed.Topics {
+			if topicResponse.Topic == nil || *topicResponse.Topic != topic {
+				continue
+			}
+			for _, partitionResponse := range topicResponse.Partitions {
+				if partitionResponse.Partition != partition {
+					continue
+				}
+				if partitionResponse.ErrorCode != protocol.ErrorCodeNone {
+					err := &protocol.ClientError{Code: partitionResponse.ErrorCode, Message: "list offsets failed"}
+					lastErr = err
+					if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
+						continue attemptLoop
+					}
+					return 0, err
+				}
+				return partitionResponse.Offset, nil
+			}
+		}
+		lastErr = errors.New("list offsets response missing partition")
+	}
+	return 0, lastErr
+}
+
 func (c *Client) startHeartbeatLoop(session GroupSession) {
 	c.stopHeartbeatLoop()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -510,6 +708,13 @@ func (c *Client) startHeartbeatLoop(session GroupSession) {
 			case <-ticker.C:
 				if err := c.heartbeat(ctx, session); err != nil {
 					c.logger.Warn(ctx, "consumer heartbeat failed", observability.Error(err))
+					if c.shouldRejoin(ctx, err) {
+						rejoinCtx, cancel := context.WithTimeout(context.Background(), c.options.SessionTimeout)
+						if rejoinErr := c.rejoin(rejoinCtx); rejoinErr != nil {
+							c.logger.Error(rejoinCtx, "consumer rejoin failed", observability.Error(rejoinErr))
+						}
+						cancel()
+					}
 				}
 			}
 		}
@@ -524,6 +729,54 @@ func (c *Client) stopHeartbeatLoop() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+func (c *Client) startAutoCommitLoop() {
+	if !c.options.EnableAutoCommit {
+		c.stopAutoCommitLoop()
+		return
+	}
+	c.stopAutoCommitLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.autoCommitCancel = cancel
+	c.mu.Unlock()
+	go func() {
+		ticker := time.NewTicker(c.options.AutoCommitInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				commitCtx, commitCancel := context.WithTimeout(context.Background(), c.options.SessionTimeout)
+				if err := c.Commit(commitCtx); err != nil {
+					c.logger.Warn(commitCtx, "consumer auto commit failed", observability.Error(err))
+				}
+				commitCancel()
+			}
+		}
+	}()
+}
+
+func (c *Client) stopAutoCommitLoop() {
+	c.mu.Lock()
+	cancel := c.autoCommitCancel
+	c.autoCommitCancel = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (c *Client) rejoin(ctx context.Context) error {
+	c.mu.Lock()
+	topics := append([]string(nil), c.subscribedTopics...)
+	c.mu.Unlock()
+	if len(topics) == 0 {
+		return nil
+	}
+	return c.joinSubscription(ctx, topics)
 }
 
 func (c *Client) heartbeat(ctx context.Context, session GroupSession) error {
@@ -658,10 +911,58 @@ func (c *Client) shouldRefreshCoordinator(ctx context.Context, err error) bool {
 	return !errors.As(err, &clientErr)
 }
 
+func (c *Client) shouldRejoin(ctx context.Context, err error) bool {
+	return c.shouldRefreshCoordinator(ctx, err) || protocol.IsRetriable(err)
+}
+
 func (c *Client) recordError(ctx context.Context, span trace.Span, msg string, err error) {
 	span.RecordError(err)
 	span.SetStatus(codes.Error, err.Error())
 	c.logger.Error(ctx, msg, observability.Error(err))
+}
+
+func (c *Client) isAssignedLocked(key imetadata.TopicPartition) bool {
+	for _, partition := range c.assignment {
+		if partition.Topic == key.Topic && partition.Partition == key.Partition {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) notifyPartitionsRevoked(ctx context.Context, partitions []TopicPartition) {
+	if c.options.RebalanceListener != nil && len(partitions) > 0 {
+		c.options.RebalanceListener.OnPartitionsRevoked(ctx, append([]TopicPartition(nil), partitions...))
+	}
+}
+
+func (c *Client) notifyPartitionsAssigned(ctx context.Context, partitions []TopicPartition) {
+	if c.options.RebalanceListener != nil && len(partitions) > 0 {
+		c.options.RebalanceListener.OnPartitionsAssigned(ctx, append([]TopicPartition(nil), partitions...))
+	}
+}
+
+func diffAssignments(left []TopicPartition, right []TopicPartition) []TopicPartition {
+	var diff []TopicPartition
+	for _, candidate := range left {
+		if !slices.ContainsFunc(right, func(existing TopicPartition) bool {
+			return existing.Topic == candidate.Topic && existing.Partition == candidate.Partition
+		}) {
+			diff = append(diff, candidate)
+		}
+	}
+	return diff
+}
+
+func keepPaused(paused map[imetadata.TopicPartition]struct{}, assignment []TopicPartition) map[imetadata.TopicPartition]struct{} {
+	next := make(map[imetadata.TopicPartition]struct{})
+	for _, partition := range assignment {
+		key := imetadata.TopicPartition{Topic: partition.Topic, Partition: partition.Partition}
+		if _, ok := paused[key]; ok {
+			next[key] = struct{}{}
+		}
+	}
+	return next
 }
 
 func (c *Client) toRecords(topic string, partition int32, fetchOffset int64, response message.FetchResponseBody) ([]Record, error) {
