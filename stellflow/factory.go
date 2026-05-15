@@ -9,6 +9,7 @@ import (
 	imetadata "github.com/stellhub/stellflow-go-sdk/internal/metadata"
 	"github.com/stellhub/stellflow-go-sdk/internal/protocolclient"
 	"github.com/stellhub/stellflow-go-sdk/internal/transport"
+	"github.com/stellhub/stellflow-go-sdk/observability"
 	"github.com/stellhub/stellflow-go-sdk/producer"
 	"github.com/stellhub/stellflow-go-sdk/protocol/codec"
 )
@@ -40,6 +41,7 @@ func NewClientFactory(options Options) (*ClientFactory, error) {
 		}
 		endpoints = append(endpoints, endpoint)
 	}
+	obs := observability.Normalize(options.Observability)
 	pool := transport.NewPool(options.MaxFrameLength)
 	protocolClient := protocolclient.NewWithOptions(pool, codec.DefaultRegistry(), options.ClientID, protocolclient.Options{
 		RequestTimeout: options.RequestTimeout,
@@ -48,8 +50,9 @@ func NewClientFactory(options Options) (*ClientFactory, error) {
 			InitialBackoff: options.Retry.InitialBackoff,
 			MaxBackoff:     options.Retry.MaxBackoff,
 		},
+		Observability: obs,
 	})
-	metadataManager := imetadata.New(protocolClient, endpoints)
+	metadataManager := imetadata.NewWithOptions(protocolClient, endpoints, imetadata.Options{Observability: obs})
 	return &ClientFactory{
 		options:  options,
 		pool:     pool,
@@ -60,17 +63,21 @@ func NewClientFactory(options Options) (*ClientFactory, error) {
 
 // NewAdmin creates an Admin client.
 func (f *ClientFactory) NewAdmin() *admin.Client {
-	return admin.New(f.protocol, f.metadata)
+	return admin.NewWithOptions(f.protocol, f.metadata, admin.Options{Observability: observability.Normalize(f.options.Observability)})
 }
 
 // NewProducer creates a Producer client.
 func (f *ClientFactory) NewProducer() *producer.Client {
-	return producer.NewWithOptions(f.protocol, f.metadata, f.options.Producer)
+	options := f.options.Producer
+	options.Observability = observability.Merge(observability.Normalize(f.options.Observability), options.Observability)
+	return producer.NewWithOptions(f.protocol, f.metadata, options)
 }
 
 // NewConsumer creates a Consumer client.
 func (f *ClientFactory) NewConsumer() *consumer.Client {
-	return consumer.New(f.protocol, f.metadata, f.options.Consumer)
+	options := f.options.Consumer
+	options.Observability = observability.Merge(observability.Normalize(f.options.Observability), options.Observability)
+	return consumer.New(f.protocol, f.metadata, options)
 }
 
 // Close closes shared transport resources.

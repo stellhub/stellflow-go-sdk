@@ -10,9 +10,13 @@ import (
 	imetadata "github.com/stellhub/stellflow-go-sdk/internal/metadata"
 	"github.com/stellhub/stellflow-go-sdk/internal/protocolclient"
 	"github.com/stellhub/stellflow-go-sdk/internal/transport"
+	"github.com/stellhub/stellflow-go-sdk/observability"
 	"github.com/stellhub/stellflow-go-sdk/protocol"
 	"github.com/stellhub/stellflow-go-sdk/protocol/codec"
 	"github.com/stellhub/stellflow-go-sdk/protocol/message"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const routeRefreshAttempts = 2
@@ -44,6 +48,7 @@ type Options struct {
 	FetchMaxBytes     int32
 	PartitionMaxBytes int32
 	CommitMetadata    string
+	Observability     observability.Options
 }
 
 // Client fetches records from manually assigned partitions.
@@ -51,6 +56,8 @@ type Client struct {
 	protocol        *protocolclient.Client
 	metadata        *imetadata.Manager
 	options         Options
+	logger          observability.Logger
+	tracer          trace.Tracer
 	assignment      []TopicPartition
 	nextOffsets     map[imetadata.TopicPartition]int64
 	consumedOffsets map[imetadata.TopicPartition]int64
@@ -85,10 +92,13 @@ func New(protocolClient *protocolclient.Client, metadataManager *imetadata.Manag
 	if options.MemberID == "" {
 		options.MemberID = "stellflow-go-consumer"
 	}
+	obs := observability.Normalize(options.Observability)
 	return &Client{
 		protocol:        protocolClient,
 		metadata:        metadataManager,
 		options:         options,
+		logger:          obs.Logger,
+		tracer:          observability.Tracer(obs),
 		nextOffsets:     make(map[imetadata.TopicPartition]int64),
 		consumedOffsets: make(map[imetadata.TopicPartition]int64),
 	}
@@ -96,11 +106,19 @@ func New(protocolClient *protocolclient.Client, metadataManager *imetadata.Manag
 
 // Subscribe joins a consumer group, loads metadata assignment, restores offsets, and starts heartbeat.
 func (c *Client) Subscribe(ctx context.Context, topics []string) error {
+	ctx, span := c.tracer.Start(ctx, "stellflow.consumer.subscribe",
+		trace.WithAttributes(attribute.Int("stellflow.topic_count", len(topics))),
+	)
+	defer span.End()
 	if c.options.GroupID == "" {
-		return errors.New("consumer group id must not be blank")
+		err := errors.New("consumer group id must not be blank")
+		c.recordError(ctx, span, "consumer subscribe failed", err)
+		return err
 	}
 	if len(topics) == 0 {
-		return errors.New("topics must not be empty")
+		err := errors.New("topics must not be empty")
+		c.recordError(ctx, span, "consumer subscribe failed", err)
+		return err
 	}
 	coordinator, err := c.findCoordinator(ctx, c.options.GroupID)
 	if err != nil {
@@ -124,6 +142,10 @@ func (c *Client) Subscribe(ctx context.Context, topics []string) error {
 	c.groupSession = &session
 	c.mu.Unlock()
 	c.startHeartbeatLoop(session)
+	c.logger.Info(ctx, "consumer subscribed",
+		observability.String("group_id", c.options.GroupID),
+		observability.Int("partition_count", len(assignment)),
+	)
 	return nil
 }
 
@@ -147,6 +169,8 @@ func (c *Client) Assign(partitions []TopicPartition) error {
 
 // Poll fetches from assigned partitions.
 func (c *Client) Poll(ctx context.Context) ([]Record, error) {
+	ctx, span := c.tracer.Start(ctx, "stellflow.consumer.poll")
+	defer span.End()
 	c.mu.Lock()
 	assignment := append([]TopicPartition(nil), c.assignment...)
 	c.mu.Unlock()
@@ -157,17 +181,23 @@ func (c *Client) Poll(ctx context.Context) ([]Record, error) {
 	for _, partition := range assignment {
 		fetched, err := c.fetchPartition(ctx, partition.Topic, partition.Partition)
 		if err != nil {
+			c.recordError(ctx, span, "consumer poll failed", err)
 			return nil, err
 		}
 		records = append(records, fetched...)
 	}
+	span.SetAttributes(attribute.Int("stellflow.record_count", len(records)))
 	return records, nil
 }
 
 // Commit commits consumed offsets for the configured group id.
 func (c *Client) Commit(ctx context.Context) error {
+	ctx, span := c.tracer.Start(ctx, "stellflow.consumer.commit")
+	defer span.End()
 	if c.options.GroupID == "" {
-		return errors.New("consumer group id must not be blank")
+		err := errors.New("consumer group id must not be blank")
+		c.recordError(ctx, span, "consumer commit failed", err)
+		return err
 	}
 	c.mu.Lock()
 	consumedOffsets := make(map[imetadata.TopicPartition]int64, len(c.consumedOffsets))
@@ -178,6 +208,7 @@ func (c *Client) Commit(ctx context.Context) error {
 	if len(consumedOffsets) == 0 {
 		return nil
 	}
+	span.SetAttributes(attribute.Int("stellflow.partition_count", len(consumedOffsets)))
 	coordinator, err := c.coordinator(ctx)
 	if err != nil {
 		return err
@@ -246,6 +277,10 @@ func (c *Client) Commit(ctx context.Context) error {
 			return lastErr
 		}
 	}
+	c.logger.Info(ctx, "consumer offsets committed",
+		observability.String("group_id", c.options.GroupID),
+		observability.Int("partition_count", len(consumedOffsets)),
+	)
 	return nil
 }
 
@@ -473,7 +508,9 @@ func (c *Client) startHeartbeatLoop(session GroupSession) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = c.heartbeat(ctx, session)
+				if err := c.heartbeat(ctx, session); err != nil {
+					c.logger.Warn(ctx, "consumer heartbeat failed", observability.Error(err))
+				}
 			}
 		}
 	}()
@@ -619,6 +656,12 @@ func (c *Client) shouldRefreshCoordinator(ctx context.Context, err error) bool {
 	}
 	var clientErr *protocol.ClientError
 	return !errors.As(err, &clientErr)
+}
+
+func (c *Client) recordError(ctx context.Context, span trace.Span, msg string, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	c.logger.Error(ctx, msg, observability.Error(err))
 }
 
 func (c *Client) toRecords(topic string, partition int32, fetchOffset int64, response message.FetchResponseBody) ([]Record, error) {

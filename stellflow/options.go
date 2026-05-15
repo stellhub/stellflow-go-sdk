@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/stellhub/stellflow-go-sdk/consumer"
+	"github.com/stellhub/stellflow-go-sdk/observability"
 	"github.com/stellhub/stellflow-go-sdk/producer"
 )
 
@@ -14,6 +15,7 @@ type Options struct {
 	MaxFrameLength   int
 	RequestTimeout   time.Duration
 	Retry            RetryOptions
+	Observability    observability.Options
 	Producer         producer.Options
 	Consumer         consumer.Options
 }

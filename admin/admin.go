@@ -6,35 +6,74 @@ import (
 
 	imetadata "github.com/stellhub/stellflow-go-sdk/internal/metadata"
 	"github.com/stellhub/stellflow-go-sdk/internal/protocolclient"
+	"github.com/stellhub/stellflow-go-sdk/observability"
 	"github.com/stellhub/stellflow-go-sdk/protocol"
 	"github.com/stellhub/stellflow-go-sdk/protocol/message"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const routeRefreshAttempts = 2
+
+// Options configures admin client behavior.
+type Options struct {
+	Observability observability.Options
+}
 
 // Client exposes administrative Stellflow APIs.
 type Client struct {
 	protocol *protocolclient.Client
 	metadata *imetadata.Manager
+	logger   observability.Logger
+	tracer   trace.Tracer
 }
 
 // New creates an admin client.
 func New(protocolClient *protocolclient.Client, metadataManager *imetadata.Manager) *Client {
-	return &Client{protocol: protocolClient, metadata: metadataManager}
+	return NewWithOptions(protocolClient, metadataManager, Options{})
+}
+
+// NewWithOptions creates an admin client with explicit options.
+func NewWithOptions(protocolClient *protocolclient.Client, metadataManager *imetadata.Manager, options Options) *Client {
+	obs := observability.Normalize(options.Observability)
+	return &Client{
+		protocol: protocolClient,
+		metadata: metadataManager,
+		logger:   obs.Logger,
+		tracer:   observability.Tracer(obs),
+	}
 }
 
 // APIVersions queries the first bootstrap broker for API versions.
 func (c *Client) APIVersions(ctx context.Context) (message.APIVersionsResponseBody, error) {
+	ctx, span := c.tracer.Start(ctx, "stellflow.admin.api_versions")
+	defer span.End()
 	bootstrap, err := c.metadata.BootstrapEndpoint()
 	if err != nil {
+		c.recordError(ctx, span, "admin api versions failed", err)
 		return message.APIVersionsResponseBody{}, err
 	}
-	return c.protocol.APIVersions(ctx, bootstrap)
+	response, err := c.protocol.APIVersions(ctx, bootstrap)
+	if err != nil {
+		c.recordError(ctx, span, "admin api versions failed", err)
+		return message.APIVersionsResponseBody{}, err
+	}
+	return response, nil
 }
 
 // Metadata queries broker metadata and refreshes the shared metadata cache.
 func (c *Client) Metadata(ctx context.Context, topics []string) (message.MetadataResponseBody, error) {
-	return c.metadata.Refresh(ctx, topics)
+	ctx, span := c.tracer.Start(ctx, "stellflow.admin.metadata",
+		trace.WithAttributes(attribute.Int("stellflow.topic_count", len(topics))),
+	)
+	defer span.End()
+	response, err := c.metadata.Refresh(ctx, topics)
+	if err != nil {
+		c.recordError(ctx, span, "admin metadata failed", err)
+		return message.MetadataResponseBody{}, err
+	}
+	return response, nil
 }
 
 // ClusterDescription is a compact cluster view built from Metadata.
@@ -70,6 +109,10 @@ type ListOffsetsRequest struct {
 
 // ListOffsets queries offsets by routing each request to the partition leader.
 func (c *Client) ListOffsets(ctx context.Context, requests []ListOffsetsRequest) (map[imetadata.TopicPartition]message.ListOffsetsPartitionResponse, error) {
+	ctx, span := c.tracer.Start(ctx, "stellflow.admin.list_offsets",
+		trace.WithAttributes(attribute.Int("stellflow.request_count", len(requests))),
+	)
+	defer span.End()
 	results := make(map[imetadata.TopicPartition]message.ListOffsetsPartitionResponse, len(requests))
 	for _, request := range requests {
 		var lastErr error
@@ -143,6 +186,7 @@ func (c *Client) ListOffsets(ctx context.Context, requests []ListOffsetsRequest)
 			return nil, lastErr
 		}
 	}
+	c.logger.Info(ctx, "admin list offsets completed", observability.Int("request_count", len(requests)))
 	return results, nil
 }
 
@@ -162,4 +206,10 @@ func shouldRefreshRoute(ctx context.Context, err error) bool {
 	}
 	var clientErr *protocol.ClientError
 	return !errors.As(err, &clientErr)
+}
+
+func (c *Client) recordError(ctx context.Context, span trace.Span, msg string, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	c.logger.Error(ctx, msg, observability.Error(err))
 }

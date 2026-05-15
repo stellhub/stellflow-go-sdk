@@ -8,8 +8,12 @@ import (
 
 	"github.com/stellhub/stellflow-go-sdk/internal/protocolclient"
 	"github.com/stellhub/stellflow-go-sdk/internal/transport"
+	"github.com/stellhub/stellflow-go-sdk/observability"
 	"github.com/stellhub/stellflow-go-sdk/protocol"
 	"github.com/stellhub/stellflow-go-sdk/protocol/message"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // TopicPartition identifies one topic partition.
@@ -27,10 +31,17 @@ type PartitionRoute struct {
 	Endpoint    transport.Endpoint
 }
 
+// Options configures metadata manager behavior.
+type Options struct {
+	Observability observability.Options
+}
+
 // Manager owns metadata refresh and route cache.
 type Manager struct {
 	client    *protocolclient.Client
 	bootstrap []transport.Endpoint
+	logger    observability.Logger
+	tracer    trace.Tracer
 	mu        sync.RWMutex
 	response  message.MetadataResponseBody
 	brokers   map[int32]transport.Endpoint
@@ -39,9 +50,17 @@ type Manager struct {
 
 // New creates a metadata manager.
 func New(client *protocolclient.Client, bootstrap []transport.Endpoint) *Manager {
+	return NewWithOptions(client, bootstrap, Options{})
+}
+
+// NewWithOptions creates a metadata manager with explicit options.
+func NewWithOptions(client *protocolclient.Client, bootstrap []transport.Endpoint, options Options) *Manager {
+	obs := observability.Normalize(options.Observability)
 	return &Manager{
 		client:    client,
 		bootstrap: append([]transport.Endpoint(nil), bootstrap...),
+		logger:    obs.Logger,
+		tracer:    observability.Tracer(obs),
 		brokers:   make(map[int32]transport.Endpoint),
 		routes:    make(map[TopicPartition]PartitionRoute),
 	}
@@ -57,23 +76,45 @@ func (m *Manager) BootstrapEndpoint() (transport.Endpoint, error) {
 
 // Refresh reloads metadata for topics.
 func (m *Manager) Refresh(ctx context.Context, topics []string) (message.MetadataResponseBody, error) {
+	ctx, span := m.tracer.Start(ctx, "stellflow.metadata.refresh",
+		trace.WithAttributes(attribute.Int("stellflow.topic_count", len(topics))),
+	)
+	defer span.End()
 	if len(m.bootstrap) == 0 {
-		return message.MetadataResponseBody{}, fmt.Errorf("bootstrap endpoints must not be empty")
+		err := fmt.Errorf("bootstrap endpoints must not be empty")
+		m.recordRefreshError(ctx, span, err)
+		return message.MetadataResponseBody{}, err
 	}
 	var lastErr error
 	for _, endpoint := range m.bootstrap {
+		m.logger.Debug(ctx, "refreshing stellflow metadata",
+			observability.String("endpoint", endpoint.Address()),
+			observability.Int("topic_count", len(topics)),
+		)
 		response, err := m.client.Metadata(ctx, endpoint, topics)
 		if err != nil {
 			lastErr = err
+			m.logger.Warn(ctx, "metadata refresh failed on bootstrap endpoint",
+				observability.String("endpoint", endpoint.Address()),
+				observability.Error(err),
+			)
 			continue
 		}
 		m.update(response)
+		m.logger.Info(ctx, "metadata refresh completed",
+			observability.String("endpoint", endpoint.Address()),
+			observability.Int("broker_count", len(response.Brokers)),
+			observability.Int("topic_count", len(response.Topics)),
+		)
 		return response, nil
 	}
 	if lastErr != nil {
+		m.recordRefreshError(ctx, span, lastErr)
 		return message.MetadataResponseBody{}, lastErr
 	}
-	return message.MetadataResponseBody{}, fmt.Errorf("metadata refresh failed")
+	err := fmt.Errorf("metadata refresh failed")
+	m.recordRefreshError(ctx, span, err)
+	return message.MetadataResponseBody{}, err
 }
 
 func (m *Manager) update(response message.MetadataResponseBody) {
@@ -137,7 +178,15 @@ func (m *Manager) Route(ctx context.Context, topic string, partition int32) (Par
 
 // RefreshRoute reloads metadata and returns the current leader route.
 func (m *Manager) RefreshRoute(ctx context.Context, topic string, partition int32) (PartitionRoute, error) {
+	ctx, span := m.tracer.Start(ctx, "stellflow.metadata.refresh_route",
+		trace.WithAttributes(
+			attribute.String("stellflow.topic", topic),
+			attribute.Int("stellflow.partition", int(partition)),
+		),
+	)
+	defer span.End()
 	if _, err := m.Refresh(ctx, []string{topic}); err != nil {
+		m.recordRefreshError(ctx, span, err)
 		return PartitionRoute{}, err
 	}
 	key := TopicPartition{Topic: topic, Partition: partition}
@@ -145,7 +194,9 @@ func (m *Manager) RefreshRoute(ctx context.Context, topic string, partition int3
 	defer m.mu.RUnlock()
 	route, ok := m.routes[key]
 	if !ok {
-		return PartitionRoute{}, fmt.Errorf("missing route for %s[%d]", topic, partition)
+		err := fmt.Errorf("missing route for %s[%d]", topic, partition)
+		m.recordRefreshError(ctx, span, err)
+		return PartitionRoute{}, err
 	}
 	return route, nil
 }
@@ -186,4 +237,10 @@ func (m *Manager) partitionIDsLocked(topic string) []int32 {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
+}
+
+func (m *Manager) recordRefreshError(ctx context.Context, span trace.Span, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	m.logger.Error(ctx, "metadata operation failed", observability.Error(err))
 }

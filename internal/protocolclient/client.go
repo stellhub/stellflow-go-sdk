@@ -7,9 +7,13 @@ import (
 	"time"
 
 	"github.com/stellhub/stellflow-go-sdk/internal/transport"
+	"github.com/stellhub/stellflow-go-sdk/observability"
 	"github.com/stellhub/stellflow-go-sdk/protocol"
 	"github.com/stellhub/stellflow-go-sdk/protocol/codec"
 	"github.com/stellhub/stellflow-go-sdk/protocol/message"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Response is a decoded protocol response.
@@ -29,6 +33,7 @@ type RetryOptions struct {
 type Options struct {
 	RequestTimeout time.Duration
 	Retry          RetryOptions
+	Observability  observability.Options
 }
 
 // Client sends Stellflow protocol requests through a transport pool.
@@ -37,6 +42,8 @@ type Client struct {
 	registry *codec.Registry
 	clientID string
 	options  Options
+	logger   observability.Logger
+	tracer   trace.Tracer
 	nextID   atomic.Int32
 }
 
@@ -51,7 +58,15 @@ func NewWithOptions(pool *transport.Pool, registry *codec.Registry, clientID str
 		registry = codec.DefaultRegistry()
 	}
 	options = normalizeOptions(options)
-	return &Client{pool: pool, registry: registry, clientID: clientID, options: options}
+	obs := observability.Normalize(options.Observability)
+	return &Client{
+		pool:     pool,
+		registry: registry,
+		clientID: clientID,
+		options:  options,
+		logger:   obs.Logger,
+		tracer:   observability.Tracer(obs),
+	}
 }
 
 // Send encodes, sends, and decodes one request.
@@ -59,8 +74,18 @@ func (c *Client) Send(ctx context.Context, endpoint transport.Endpoint, apiKey p
 	if c.pool == nil {
 		return Response{}, errors.New("protocol client requires transport pool")
 	}
+	ctx, span := c.tracer.Start(ctx, "stellflow.protocol.send",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("stellflow.endpoint", endpoint.Address()),
+			attribute.Int("stellflow.api_key", int(apiKey.Code())),
+			attribute.Int("stellflow.api_version", int(apiVersion)),
+		),
+	)
+	defer span.End()
 	requestBody, err := c.registry.EncodeRequestBody(apiKey, apiVersion, body)
 	if err != nil {
+		c.recordError(ctx, span, "encode request body failed", err, apiKey, endpoint, 0)
 		return Response{}, err
 	}
 	clientID := c.clientID
@@ -71,6 +96,13 @@ func (c *Client) Send(ctx context.Context, endpoint transport.Endpoint, apiKey p
 	}
 	var lastErr error
 	for attempt := 1; attempt <= c.options.Retry.MaxAttempts; attempt++ {
+		span.SetAttributes(attribute.Int("stellflow.attempt", attempt))
+		c.logger.Debug(ctx, "sending stellflow request",
+			observability.String("endpoint", endpoint.Address()),
+			observability.Int16("api_key", apiKey.Code()),
+			observability.Int16("api_version", apiVersion),
+			observability.Int("attempt", attempt),
+		)
 		header := protocol.RequestHeader{
 			APIKey:        apiKey,
 			APIVersion:    apiVersion,
@@ -78,13 +110,17 @@ func (c *Client) Send(ctx context.Context, endpoint transport.Endpoint, apiKey p
 			CorrelationID: c.nextCorrelationID(),
 			ClientID:      &clientID,
 		}
+		c.injectTraceHeader(ctx, &header)
 		conn, err := c.pool.Get(ctx, endpoint)
 		if err != nil {
 			lastErr = err
 			if !c.canRetry(ctx, attempt, err) {
+				c.recordError(ctx, span, "get connection failed", err, apiKey, endpoint, attempt)
 				return Response{}, err
 			}
+			c.logRetry(ctx, err, apiKey, endpoint, attempt)
 			if err := c.backoff(ctx, attempt); err != nil {
+				c.recordError(ctx, span, "backoff interrupted", err, apiKey, endpoint, attempt)
 				return Response{}, err
 			}
 			continue
@@ -96,9 +132,12 @@ func (c *Client) Send(ctx context.Context, endpoint transport.Endpoint, apiKey p
 			}
 			lastErr = err
 			if !c.canRetry(ctx, attempt, err) {
+				c.recordError(ctx, span, "send request failed", err, apiKey, endpoint, attempt)
 				return Response{}, err
 			}
+			c.logRetry(ctx, err, apiKey, endpoint, attempt)
 			if err := c.backoff(ctx, attempt); err != nil {
+				c.recordError(ctx, span, "backoff interrupted", err, apiKey, endpoint, attempt)
 				return Response{}, err
 			}
 			continue
@@ -107,18 +146,32 @@ func (c *Client) Send(ctx context.Context, endpoint transport.Endpoint, apiKey p
 			err := &protocol.ClientError{Code: rawResponse.Header.ErrorCode, Message: "request failed"}
 			lastErr = err
 			if !c.canRetry(ctx, attempt, err) {
+				c.recordError(ctx, span, "request returned protocol error", err, apiKey, endpoint, attempt)
 				return Response{Header: rawResponse.Header}, err
 			}
+			c.logRetry(ctx, err, apiKey, endpoint, attempt)
 			if err := c.backoff(ctx, attempt); err != nil {
+				c.recordError(ctx, span, "backoff interrupted", err, apiKey, endpoint, attempt)
 				return Response{}, err
 			}
 			continue
 		}
 		responseBody, err := c.registry.DecodeResponseBody(apiKey, apiVersion, rawResponse.Body)
 		if err != nil {
+			c.recordError(ctx, span, "decode response body failed", err, apiKey, endpoint, attempt)
 			return Response{}, err
 		}
+		c.logger.Debug(ctx, "stellflow request completed",
+			observability.String("endpoint", endpoint.Address()),
+			observability.Int16("api_key", apiKey.Code()),
+			observability.Int32("correlation_id", rawResponse.Header.CorrelationID),
+			observability.Int32("throttle_time_ms", rawResponse.Header.ThrottleTimeMs),
+			observability.Int("attempt", attempt),
+		)
 		return Response{Header: rawResponse.Header, Body: responseBody}, nil
+	}
+	if lastErr != nil {
+		c.recordError(ctx, span, "request attempts exhausted", lastErr, apiKey, endpoint, c.options.Retry.MaxAttempts)
 	}
 	return Response{}, lastErr
 }
@@ -232,4 +285,37 @@ func (c *Client) backoffDelay(attempt int) time.Duration {
 
 func isTransportRetryable(err error) bool {
 	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+func (c *Client) injectTraceHeader(ctx context.Context, header *protocol.RequestHeader) {
+	spanContext := trace.SpanContextFromContext(ctx)
+	if !spanContext.IsValid() {
+		return
+	}
+	traceID := spanContext.TraceID().String()
+	spanID := spanContext.SpanID().String()
+	header.TraceID = &traceID
+	header.SpanID = &spanID
+	header.TraceFlags = int8(spanContext.TraceFlags())
+}
+
+func (c *Client) recordError(ctx context.Context, span trace.Span, message string, err error, apiKey protocol.ApiKey, endpoint transport.Endpoint, attempt int) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	c.logger.Error(ctx, message,
+		observability.String("endpoint", endpoint.Address()),
+		observability.Int16("api_key", apiKey.Code()),
+		observability.Int("attempt", attempt),
+		observability.Error(err),
+	)
+}
+
+func (c *Client) logRetry(ctx context.Context, err error, apiKey protocol.ApiKey, endpoint transport.Endpoint, attempt int) {
+	c.logger.Warn(ctx, "retrying stellflow request",
+		observability.String("endpoint", endpoint.Address()),
+		observability.Int16("api_key", apiKey.Code()),
+		observability.Int("attempt", attempt),
+		observability.Duration("backoff", c.backoffDelay(attempt)),
+		observability.Error(err),
+	)
 }

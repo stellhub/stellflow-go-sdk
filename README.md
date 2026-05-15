@@ -371,6 +371,41 @@ SDK core 不依赖具体框架。Go 侧建议通过标准库日志、OpenTelemet
 - OffsetCommit 成功次数。
 - Join / Sync / Heartbeat 操作次数。
 
+框架集成时，通过 `stellflow.Options.Observability` 注入框架统一管理的 OpenTelemetry `TracerProvider` 和日志适配器：
+
+```go
+factory, err := stellflow.NewClientFactory(stellflow.Options{
+	BootstrapServers: []string{"stellflow://127.0.0.1:9092"},
+	ClientID:         "orders-service",
+	Observability: observability.Options{
+		TracerProvider: tracerProvider,
+		Logger:         frameworkLogger,
+	},
+})
+```
+
+非框架场景可以直接使用 SDK 提供的 zap rolling file logger：
+
+```go
+logger, err := observability.NewZapRollingFileLogger(observability.ZapRollingFileConfig{
+	Filename:   "./logs/stellflow-sdk.log",
+	Level:      "info",
+	MaxSizeMB:  100,
+	MaxBackups: 7,
+	MaxAgeDays: 14,
+	Compress:   true,
+})
+if err != nil {
+	log.Fatal(err)
+}
+defer logger.Close()
+
+factory, err := stellflow.NewClientFactory(stellflow.Options{
+	BootstrapServers: []string{"stellflow://127.0.0.1:9092"},
+	Observability: observability.Options{Logger: logger},
+})
+```
+
 `clientId`、`tenantId`、`trafficTag` 等字段可能是高基数字段，默认不要作为全局指标标签直接暴露。
 
 ## 实现顺序

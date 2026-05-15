@@ -1,19 +1,24 @@
 package producer
 
-import "time"
+import (
+	"time"
+
+	"github.com/stellhub/stellflow-go-sdk/observability"
+)
 
 // Partitioner selects a partition for a record when Record.Partition is not set.
 type Partitioner func(record Record, partitions []int32) (int32, error)
 
 // Options configures producer batching and partitioning.
 type Options struct {
-	Acks        int16
-	TimeoutMs   int32
-	BatchSize   int
-	BatchBytes  int
-	Linger      time.Duration
-	QueueSize   int
-	Partitioner Partitioner
+	Acks          int16
+	TimeoutMs     int32
+	BatchSize     int
+	BatchBytes    int
+	Linger        time.Duration
+	QueueSize     int
+	Partitioner   Partitioner
+	Observability observability.Options
 }
 
 func normalizeOptions(options Options) Options {
