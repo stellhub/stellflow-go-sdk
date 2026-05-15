@@ -3,6 +3,9 @@ package consumer
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"time"
 
 	imetadata "github.com/stellhub/stellflow-go-sdk/internal/metadata"
 	"github.com/stellhub/stellflow-go-sdk/internal/protocolclient"
@@ -33,6 +36,9 @@ type Record struct {
 // Options configures a consumer.
 type Options struct {
 	GroupID           string
+	MemberID          string
+	SessionTimeout    time.Duration
+	HeartbeatInterval time.Duration
 	FetchMaxBytes     int32
 	PartitionMaxBytes int32
 	CommitMetadata    string
@@ -46,6 +52,18 @@ type Client struct {
 	assignment      []TopicPartition
 	nextOffsets     map[imetadata.TopicPartition]int64
 	consumedOffsets map[imetadata.TopicPartition]int64
+	mu              sync.Mutex
+	groupSession    *GroupSession
+	heartbeatCancel context.CancelFunc
+}
+
+// GroupSession describes the active consumer group session.
+type GroupSession struct {
+	GroupID      string
+	GenerationID int32
+	MemberID     string
+	LeaderID     string
+	Coordinator  transport.Endpoint
 }
 
 // New creates a consumer.
@@ -56,6 +74,15 @@ func New(protocolClient *protocolclient.Client, metadataManager *imetadata.Manag
 	if options.PartitionMaxBytes == 0 {
 		options.PartitionMaxBytes = options.FetchMaxBytes
 	}
+	if options.SessionTimeout == 0 {
+		options.SessionTimeout = 30 * time.Second
+	}
+	if options.HeartbeatInterval == 0 {
+		options.HeartbeatInterval = 3 * time.Second
+	}
+	if options.MemberID == "" {
+		options.MemberID = "stellflow-go-consumer"
+	}
 	return &Client{
 		protocol:        protocolClient,
 		metadata:        metadataManager,
@@ -65,11 +92,48 @@ func New(protocolClient *protocolclient.Client, metadataManager *imetadata.Manag
 	}
 }
 
+// Subscribe joins a consumer group, loads metadata assignment, restores offsets, and starts heartbeat.
+func (c *Client) Subscribe(ctx context.Context, topics []string) error {
+	if c.options.GroupID == "" {
+		return errors.New("consumer group id must not be blank")
+	}
+	if len(topics) == 0 {
+		return errors.New("topics must not be empty")
+	}
+	coordinator, err := c.findCoordinator(ctx, c.options.GroupID)
+	if err != nil {
+		return err
+	}
+	session, err := c.joinGroup(ctx, coordinator)
+	if err != nil {
+		return err
+	}
+	if err := c.syncGroup(ctx, session); err != nil {
+		return err
+	}
+	assignment, err := c.assignmentFromMetadata(ctx, topics)
+	if err != nil {
+		return err
+	}
+	if err := c.assignWithOffsets(ctx, coordinator, assignment); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.groupSession = &session
+	c.mu.Unlock()
+	c.startHeartbeatLoop(session)
+	return nil
+}
+
 // Assign manually assigns partitions. It does not join a consumer group.
 func (c *Client) Assign(partitions []TopicPartition) error {
 	if len(partitions) == 0 {
 		return errors.New("partitions must not be empty")
 	}
+	c.stopHeartbeatLoop()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.groupSession = nil
 	c.assignment = append([]TopicPartition(nil), partitions...)
 	c.nextOffsets = make(map[imetadata.TopicPartition]int64, len(partitions))
 	c.consumedOffsets = make(map[imetadata.TopicPartition]int64)
@@ -81,11 +145,14 @@ func (c *Client) Assign(partitions []TopicPartition) error {
 
 // Poll fetches from assigned partitions.
 func (c *Client) Poll(ctx context.Context) ([]Record, error) {
-	if len(c.assignment) == 0 {
+	c.mu.Lock()
+	assignment := append([]TopicPartition(nil), c.assignment...)
+	c.mu.Unlock()
+	if len(assignment) == 0 {
 		return nil, nil
 	}
 	var records []Record
-	for _, partition := range c.assignment {
+	for _, partition := range assignment {
 		fetched, err := c.fetchPartition(ctx, partition.Topic, partition.Partition)
 		if err != nil {
 			return nil, err
@@ -100,16 +167,22 @@ func (c *Client) Commit(ctx context.Context) error {
 	if c.options.GroupID == "" {
 		return errors.New("consumer group id must not be blank")
 	}
-	if len(c.consumedOffsets) == 0 {
+	c.mu.Lock()
+	consumedOffsets := make(map[imetadata.TopicPartition]int64, len(c.consumedOffsets))
+	for partition, offset := range c.consumedOffsets {
+		consumedOffsets[partition] = offset
+	}
+	c.mu.Unlock()
+	if len(consumedOffsets) == 0 {
 		return nil
 	}
-	coordinator, err := c.findCoordinator(ctx, c.options.GroupID)
+	coordinator, err := c.coordinator(ctx)
 	if err != nil {
 		return err
 	}
 	groupID := c.options.GroupID
 	metadata := c.options.CommitMetadata
-	for partition, offset := range c.consumedOffsets {
+	for partition, offset := range consumedOffsets {
 		body := message.OffsetCommitRequestBody{
 			GroupID: &groupID,
 			Topics: []message.OffsetCommitTopic{
@@ -143,6 +216,12 @@ func (c *Client) Commit(ctx context.Context) error {
 	return nil
 }
 
+// Close stops background group work. It does not close the shared factory transport.
+func (c *Client) Close() error {
+	c.stopHeartbeatLoop()
+	return nil
+}
+
 func (c *Client) findCoordinator(ctx context.Context, groupID string) (transport.Endpoint, error) {
 	bootstrap, err := c.metadata.BootstrapEndpoint()
 	if err != nil {
@@ -166,9 +245,208 @@ func (c *Client) findCoordinator(ctx context.Context, groupID string) (transport
 	return transport.Endpoint{Host: *typed.Host, Port: int(typed.Port)}, nil
 }
 
+func (c *Client) coordinator(ctx context.Context) (transport.Endpoint, error) {
+	c.mu.Lock()
+	session := c.groupSession
+	c.mu.Unlock()
+	if session != nil {
+		return session.Coordinator, nil
+	}
+	return c.findCoordinator(ctx, c.options.GroupID)
+}
+
+func (c *Client) joinGroup(ctx context.Context, coordinator transport.Endpoint) (GroupSession, error) {
+	groupID := c.options.GroupID
+	memberID := c.options.MemberID
+	body := message.JoinGroupRequestBody{
+		GroupID:          &groupID,
+		MemberID:         &memberID,
+		SessionTimeoutMs: int32(c.options.SessionTimeout / time.Millisecond),
+	}
+	response, err := c.protocol.Send(ctx, coordinator, protocol.ApiKeyJoinGroup, protocol.DefaultAPIVersion, body)
+	if err != nil {
+		return GroupSession{}, err
+	}
+	typed, ok := response.Body.(message.JoinGroupResponseBody)
+	if !ok {
+		return GroupSession{}, errors.New("unexpected JoinGroup response body")
+	}
+	if typed.ErrorCode != protocol.ErrorCodeNone {
+		return GroupSession{}, &protocol.ClientError{Code: typed.ErrorCode, Message: "join group failed"}
+	}
+	if typed.MemberID != nil {
+		memberID = *typed.MemberID
+	}
+	leaderID := ""
+	if typed.LeaderID != nil {
+		leaderID = *typed.LeaderID
+	}
+	return GroupSession{
+		GroupID:      groupID,
+		GenerationID: typed.GenerationID,
+		MemberID:     memberID,
+		LeaderID:     leaderID,
+		Coordinator:  coordinator,
+	}, nil
+}
+
+func (c *Client) syncGroup(ctx context.Context, session GroupSession) error {
+	groupID := session.GroupID
+	memberID := session.MemberID
+	body := message.SyncGroupRequestBody{
+		GroupID:      &groupID,
+		GenerationID: session.GenerationID,
+		MemberID:     &memberID,
+	}
+	response, err := c.protocol.Send(ctx, session.Coordinator, protocol.ApiKeySyncGroup, protocol.DefaultAPIVersion, body)
+	if err != nil {
+		return err
+	}
+	typed, ok := response.Body.(message.SyncGroupResponseBody)
+	if !ok {
+		return errors.New("unexpected SyncGroup response body")
+	}
+	if typed.ErrorCode != protocol.ErrorCodeNone {
+		return &protocol.ClientError{Code: typed.ErrorCode, Message: "sync group failed"}
+	}
+	return nil
+}
+
+func (c *Client) assignmentFromMetadata(ctx context.Context, topics []string) ([]TopicPartition, error) {
+	response, err := c.metadata.Refresh(ctx, topics)
+	if err != nil {
+		return nil, err
+	}
+	var assignment []TopicPartition
+	for _, topic := range response.Topics {
+		if topic.Topic == nil || topic.ErrorCode != protocol.ErrorCodeNone {
+			continue
+		}
+		for _, partition := range topic.Partitions {
+			if partition.ErrorCode != protocol.ErrorCodeNone {
+				continue
+			}
+			assignment = append(assignment, TopicPartition{Topic: *topic.Topic, Partition: partition.Partition})
+		}
+	}
+	if len(assignment) == 0 {
+		return nil, fmt.Errorf("subscription has no assigned partitions")
+	}
+	return assignment, nil
+}
+
+func (c *Client) assignWithOffsets(ctx context.Context, coordinator transport.Endpoint, assignment []TopicPartition) error {
+	nextOffsets := make(map[imetadata.TopicPartition]int64, len(assignment))
+	for _, partition := range assignment {
+		offset, err := c.fetchCommittedOffset(ctx, coordinator, partition.Topic, partition.Partition)
+		if err != nil {
+			return err
+		}
+		if offset < 0 {
+			offset = 0
+		}
+		key := imetadata.TopicPartition{Topic: partition.Topic, Partition: partition.Partition}
+		nextOffsets[key] = offset
+	}
+	c.mu.Lock()
+	c.assignment = append([]TopicPartition(nil), assignment...)
+	c.nextOffsets = nextOffsets
+	c.consumedOffsets = make(map[imetadata.TopicPartition]int64)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) fetchCommittedOffset(ctx context.Context, coordinator transport.Endpoint, topic string, partition int32) (int64, error) {
+	groupID := c.options.GroupID
+	body := message.OffsetFetchRequestBody{
+		GroupID: &groupID,
+		Topics: []message.OffsetFetchTopic{
+			{Topic: topic, Partitions: []message.OffsetFetchPartition{{Partition: partition}}},
+		},
+	}
+	response, err := c.protocol.Send(ctx, coordinator, protocol.ApiKeyOffsetFetch, protocol.DefaultAPIVersion, body)
+	if err != nil {
+		return 0, err
+	}
+	typed, ok := response.Body.(message.OffsetFetchResponseBody)
+	if !ok {
+		return 0, errors.New("unexpected OffsetFetch response body")
+	}
+	for _, topicResponse := range typed.Topics {
+		if topicResponse.Topic == nil || *topicResponse.Topic != topic {
+			continue
+		}
+		for _, partitionResponse := range topicResponse.Partitions {
+			if partitionResponse.Partition != partition {
+				continue
+			}
+			if partitionResponse.ErrorCode != protocol.ErrorCodeNone {
+				return 0, &protocol.ClientError{Code: partitionResponse.ErrorCode, Message: "offset fetch failed"}
+			}
+			return partitionResponse.Offset, nil
+		}
+	}
+	return 0, errors.New("offset fetch response missing partition")
+}
+
+func (c *Client) startHeartbeatLoop(session GroupSession) {
+	c.stopHeartbeatLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.heartbeatCancel = cancel
+	c.mu.Unlock()
+	interval := c.options.HeartbeatInterval
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = c.heartbeat(ctx, session)
+			}
+		}
+	}()
+}
+
+func (c *Client) stopHeartbeatLoop() {
+	c.mu.Lock()
+	cancel := c.heartbeatCancel
+	c.heartbeatCancel = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (c *Client) heartbeat(ctx context.Context, session GroupSession) error {
+	groupID := session.GroupID
+	memberID := session.MemberID
+	body := message.HeartbeatRequestBody{
+		GroupID:      &groupID,
+		GenerationID: session.GenerationID,
+		MemberID:     &memberID,
+	}
+	response, err := c.protocol.Send(ctx, session.Coordinator, protocol.ApiKeyHeartbeat, protocol.DefaultAPIVersion, body)
+	if err != nil {
+		return err
+	}
+	typed, ok := response.Body.(message.HeartbeatResponseBody)
+	if !ok {
+		return errors.New("unexpected Heartbeat response body")
+	}
+	if typed.ErrorCode != protocol.ErrorCodeNone {
+		return &protocol.ClientError{Code: typed.ErrorCode, Message: "heartbeat failed"}
+	}
+	return nil
+}
+
 func (c *Client) fetchPartition(ctx context.Context, topic string, partition int32) ([]Record, error) {
 	key := imetadata.TopicPartition{Topic: topic, Partition: partition}
+	c.mu.Lock()
 	fetchOffset := c.nextOffsets[key]
+	c.mu.Unlock()
 	route, err := c.metadata.Route(ctx, topic, partition)
 	if err != nil {
 		return nil, err
@@ -228,6 +506,7 @@ func (c *Client) toRecords(topic string, partition int32, fetchOffset int64, res
 				baseOffset := fetchOffset + int64(batch.BaseOffsetDelta)
 				for _, batchRecord := range batch.Records {
 					offset := baseOffset + int64(batchRecord.OffsetDelta)
+					nextOffset := offset + 1
 					records = append(records, Record{
 						Topic:     topic,
 						Partition: partition,
@@ -237,8 +516,10 @@ func (c *Client) toRecords(topic string, partition int32, fetchOffset int64, res
 						Headers:   batchRecord.Headers,
 						Timestamp: batch.BaseTimestamp + batchRecord.TimestampDelta,
 					})
-					c.nextOffsets[key] = offset + 1
-					c.consumedOffsets[key] = offset + 1
+					c.mu.Lock()
+					c.nextOffsets[key] = nextOffset
+					c.consumedOffsets[key] = nextOffset
+					c.mu.Unlock()
 				}
 			}
 		}

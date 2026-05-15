@@ -52,8 +52,16 @@ func DefaultRegistry() *Registry {
 	registry.RegisterResponseDecoder(protocol.ApiKeyListOffsets, protocol.DefaultAPIVersion, decodeListOffsetsResponseBodyAny)
 	registry.RegisterRequestEncoder(protocol.ApiKeyOffsetCommit, protocol.DefaultAPIVersion, encodeOffsetCommitRequestBodyAny)
 	registry.RegisterResponseDecoder(protocol.ApiKeyOffsetCommit, protocol.DefaultAPIVersion, decodeOffsetCommitResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeyOffsetFetch, protocol.DefaultAPIVersion, encodeOffsetFetchRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeyOffsetFetch, protocol.DefaultAPIVersion, decodeOffsetFetchResponseBodyAny)
 	registry.RegisterRequestEncoder(protocol.ApiKeyFindCoordinator, protocol.DefaultAPIVersion, encodeFindCoordinatorRequestBodyAny)
 	registry.RegisterResponseDecoder(protocol.ApiKeyFindCoordinator, protocol.DefaultAPIVersion, decodeFindCoordinatorResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeyHeartbeat, protocol.DefaultAPIVersion, encodeHeartbeatRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeyHeartbeat, protocol.DefaultAPIVersion, decodeHeartbeatResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeyJoinGroup, protocol.DefaultAPIVersion, encodeJoinGroupRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeyJoinGroup, protocol.DefaultAPIVersion, decodeJoinGroupResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeySyncGroup, protocol.DefaultAPIVersion, encodeSyncGroupRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeySyncGroup, protocol.DefaultAPIVersion, decodeSyncGroupResponseBodyAny)
 	return registry
 }
 

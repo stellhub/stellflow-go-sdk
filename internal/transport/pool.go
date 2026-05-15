@@ -10,6 +10,7 @@ type Pool struct {
 	maxFrameLength int
 	mu             sync.Mutex
 	connections    map[string]*Connection
+	dialing        map[string]chan struct{}
 }
 
 // NewPool creates a connection pool.
@@ -17,29 +18,53 @@ func NewPool(maxFrameLength int) *Pool {
 	if maxFrameLength <= 0 {
 		maxFrameLength = DefaultMaxFrameLength
 	}
-	return &Pool{maxFrameLength: maxFrameLength, connections: make(map[string]*Connection)}
+	return &Pool{
+		maxFrameLength: maxFrameLength,
+		connections:    make(map[string]*Connection),
+		dialing:        make(map[string]chan struct{}),
+	}
 }
 
 // Get returns a connection for endpoint.
 func (p *Pool) Get(ctx context.Context, endpoint Endpoint) (*Connection, error) {
 	key := endpoint.Address()
-	p.mu.Lock()
-	conn := p.connections[key]
-	p.mu.Unlock()
-	if conn != nil {
-		return conn, nil
+	for {
+		p.mu.Lock()
+		if conn := p.connections[key]; conn != nil {
+			p.mu.Unlock()
+			return conn, nil
+		}
+		wait, ok := p.dialing[key]
+		if !ok {
+			wait = make(chan struct{})
+			p.dialing[key] = wait
+			p.mu.Unlock()
+			break
+		}
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-wait:
+		}
 	}
+
 	created, err := Dial(ctx, endpoint, p.maxFrameLength)
+	p.mu.Lock()
+	wait := p.dialing[key]
+	delete(p.dialing, key)
+	close(wait)
 	if err != nil {
+		p.mu.Unlock()
 		return nil, err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if existing := p.connections[key]; existing != nil {
+		p.mu.Unlock()
 		_ = created.Close()
 		return existing, nil
 	}
 	p.connections[key] = created
+	p.mu.Unlock()
 	return created, nil
 }
 
