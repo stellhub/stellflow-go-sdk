@@ -19,8 +19,6 @@ import (
 
 const NoPartition int32 = -1
 
-const routeRefreshAttempts = 2
-
 // ErrClosed is returned when producer methods are called after Close.
 var ErrClosed = errors.New("producer is closed")
 
@@ -54,7 +52,15 @@ type Client struct {
 	mu         sync.Mutex
 	roundRobin int
 	closed     bool
-	inFlight   chan struct{}
+	inFlightMu sync.Mutex
+	inFlight   map[string]chan struct{}
+	orderMu    sync.Mutex
+	orderLocks map[batchKey]chan struct{}
+	initMu     sync.Mutex
+	stateMu    sync.Mutex
+	producerID int64
+	epoch      int16
+	sequences  map[batchKey]int32
 	workerOnce sync.Once
 	closeOnce  sync.Once
 	asyncCh    chan asyncRecord
@@ -80,7 +86,11 @@ func NewWithOptions(protocolClient *protocolclient.Client, metadataManager *imet
 		tracer:     observability.Tracer(obs),
 		Acks:       options.Acks,
 		Timeout:    options.TimeoutMs,
-		inFlight:   make(chan struct{}, options.MaxInFlight),
+		inFlight:   make(map[string]chan struct{}),
+		orderLocks: make(map[batchKey]chan struct{}),
+		producerID: options.ProducerID,
+		epoch:      options.ProducerEpoch,
+		sequences:  make(map[batchKey]int32),
 		asyncCh:    make(chan asyncRecord, options.QueueSize),
 		flushCh:    make(chan flushRequest),
 		stopCh:     make(chan struct{}),
@@ -160,9 +170,13 @@ func (c *Client) SendAsync(ctx context.Context, record Record) (*Future, error) 
 
 // Flush sends all buffered asynchronous records.
 func (c *Client) Flush(ctx context.Context) error {
+	return c.flush(ctx, false)
+}
+
+func (c *Client) flush(ctx context.Context, allowClosed bool) error {
 	ctx, span := c.tracer.Start(ctx, "stellflow.producer.flush")
 	defer span.End()
-	if c.isClosed() {
+	if !allowClosed && c.isClosed() {
 		return ErrClosed
 	}
 	c.ensureWorker()
@@ -191,10 +205,8 @@ func (c *Client) Flush(ctx context.Context) error {
 func (c *Client) Close(ctx context.Context) error {
 	var closeErr error
 	c.closeOnce.Do(func() {
-		closeErr = c.Flush(ctx)
-		c.mu.Lock()
-		c.closed = true
-		c.mu.Unlock()
+		c.markClosed()
+		closeErr = c.flush(ctx, true)
 		close(c.stopCh)
 		<-c.workerDone
 	})
@@ -242,9 +254,20 @@ func (c *Client) produceRecords(ctx context.Context, topic string, partition int
 		),
 	)
 	defer span.End()
+	key := batchKey{topic: topic, partition: partition}
+	if err := c.acquireOrdering(ctx, key); err != nil {
+		c.recordError(ctx, span, "producer ordering wait failed", err)
+		return nil, err
+	}
+	defer c.releaseOrdering(key)
+	if err := c.ensureProducerID(ctx); err != nil {
+		c.recordError(ctx, span, "producer id initialization failed", err)
+		return nil, err
+	}
+	producerID, producerEpoch, baseSequence := c.batchIdentity(key)
 	var lastErr error
 attemptLoop:
-	for attempt := 1; attempt <= routeRefreshAttempts; attempt++ {
+	for attempt := 1; attempt <= c.options.RetryMaxAttempts; attempt++ {
 		route, err := c.route(ctx, topic, partition, attempt)
 		if err != nil {
 			c.recordError(ctx, span, "producer route lookup failed", err)
@@ -255,33 +278,44 @@ attemptLoop:
 		batch.PartitionLeaderEpoch = route.LeaderEpoch
 		batch.BaseTimestamp = now
 		batch.MaxTimestamp = now
+		batch.ProducerID = producerID
+		batch.ProducerEpoch = producerEpoch
+		batch.BaseSequence = baseSequence
 		batchBytes, err := codec.EncodeRecordBatchSet([]message.RecordBatch{batch})
 		if err != nil {
 			c.recordError(ctx, span, "producer record batch encode failed", err)
 			return nil, err
 		}
 		body := message.ProduceRequestBody{
-			Acks:      c.Acks,
-			TimeoutMs: c.Timeout,
+			TransactionalID: c.transactionalID(),
+			Acks:            c.Acks,
+			TimeoutMs:       c.Timeout,
 			TopicData: []message.ProduceTopicData{
 				{Topic: topic, Partitions: []message.ProducePartitionData{{Partition: partition, Records: batchBytes}}},
 			},
 		}
-		if err := c.acquireInFlight(ctx); err != nil {
+		endpoint := route.Endpoint.Address()
+		if err := c.acquireInFlight(ctx, endpoint); err != nil {
 			c.recordError(ctx, span, "producer in-flight limit wait failed", err)
 			return nil, err
 		}
-		response, err := c.protocol.Send(ctx, route.Endpoint, protocol.ApiKeyProduce, protocol.DefaultAPIVersion, body)
-		c.releaseInFlight()
+		requestCtx, requestCancel := c.requestContext(ctx)
+		response, err := c.protocol.Send(requestCtx, route.Endpoint, protocol.ApiKeyProduce, protocol.DefaultAPIVersion, body)
+		requestCancel()
+		c.releaseInFlight(endpoint)
 		if err != nil {
 			lastErr = err
-			if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
-				c.logger.Warn(ctx, "producer send will refresh route",
+			if attempt < c.options.RetryMaxAttempts && shouldRetryProduce(ctx, err) {
+				c.logger.Warn(ctx, "producer send will retry",
 					observability.String("topic", topic),
 					observability.Int32("partition", partition),
 					observability.Int("attempt", attempt),
 					observability.Error(err),
 				)
+				if err := c.retryBackoff(ctx); err != nil {
+					c.recordError(ctx, span, "producer retry backoff interrupted", err)
+					return nil, err
+				}
 				continue
 			}
 			c.recordError(ctx, span, "producer produce request failed", err)
@@ -304,13 +338,17 @@ attemptLoop:
 				if partitionResponse.ErrorCode != protocol.ErrorCodeNone {
 					err := &protocol.ClientError{Code: partitionResponse.ErrorCode, Message: "produce partition failed"}
 					lastErr = err
-					if attempt < routeRefreshAttempts && shouldRefreshRoute(ctx, err) {
-						c.logger.Warn(ctx, "producer partition error will refresh route",
+					if attempt < c.options.RetryMaxAttempts && shouldRetryProduce(ctx, err) {
+						c.logger.Warn(ctx, "producer partition error will retry",
 							observability.String("topic", topic),
 							observability.Int32("partition", partition),
 							observability.Int("attempt", attempt),
 							observability.Error(err),
 						)
+						if err := c.retryBackoff(ctx); err != nil {
+							c.recordError(ctx, span, "producer retry backoff interrupted", err)
+							return nil, err
+						}
 						continue attemptLoop
 					}
 					c.recordError(ctx, span, "producer partition failed", err)
@@ -322,6 +360,7 @@ attemptLoop:
 					observability.Int64("base_offset", partitionResponse.BaseOffset),
 					observability.Int("record_count", len(records)),
 				)
+				c.commitSequence(key, len(records))
 				return metadataFromResponse(topic, partitionResponse, len(records)), nil
 			}
 		}
@@ -340,6 +379,62 @@ func (c *Client) route(ctx context.Context, topic string, partition int32, attem
 	return c.metadata.RefreshRoute(ctx, topic, partition)
 }
 
+func (c *Client) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.options.RequestTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.options.RequestTimeout)
+}
+
+func (c *Client) retryBackoff(ctx context.Context) error {
+	if c.options.RetryBackoff <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(c.options.RetryBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *Client) acquireOrdering(ctx context.Context, key batchKey) error {
+	if c.options.Ordering != OrderingPerPartition {
+		return nil
+	}
+	c.orderMu.Lock()
+	lock := c.orderLocks[key]
+	if lock == nil {
+		lock = make(chan struct{}, 1)
+		c.orderLocks[key] = lock
+	}
+	c.orderMu.Unlock()
+	select {
+	case lock <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) releaseOrdering(key batchKey) {
+	if c.options.Ordering != OrderingPerPartition {
+		return
+	}
+	c.orderMu.Lock()
+	lock := c.orderLocks[key]
+	c.orderMu.Unlock()
+	if lock == nil {
+		return
+	}
+	select {
+	case <-lock:
+	default:
+	}
+}
+
 func shouldRefreshRoute(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil {
 		return false
@@ -351,24 +446,75 @@ func shouldRefreshRoute(ctx context.Context, err error) bool {
 	return !errors.As(err, &clientErr)
 }
 
+func shouldRetryProduce(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	return shouldRefreshRoute(ctx, err) || protocol.IsRetriable(err)
+}
+
+func (c *Client) transactionalID() *string {
+	if c.options.TransactionalID == "" {
+		return nil
+	}
+	return &c.options.TransactionalID
+}
+
+func (c *Client) batchIdentity(key batchKey) (int64, int16, int32) {
+	if !c.options.Idempotent {
+		return -1, -1, -1
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.producerID, c.epoch, c.sequences[key]
+}
+
+func (c *Client) commitSequence(key batchKey, count int) {
+	if !c.options.Idempotent || count <= 0 {
+		return
+	}
+	c.stateMu.Lock()
+	c.sequences[key] += int32(count)
+	c.stateMu.Unlock()
+}
+
 func (c *Client) isClosed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.closed
 }
 
-func (c *Client) acquireInFlight(ctx context.Context) error {
+func (c *Client) markClosed() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+}
+
+func (c *Client) acquireInFlight(ctx context.Context, endpoint string) error {
+	c.inFlightMu.Lock()
+	limiter := c.inFlight[endpoint]
+	if limiter == nil {
+		limiter = make(chan struct{}, c.options.MaxInFlight)
+		c.inFlight[endpoint] = limiter
+	}
+	c.inFlightMu.Unlock()
 	select {
-	case c.inFlight <- struct{}{}:
+	case limiter <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (c *Client) releaseInFlight() {
+func (c *Client) releaseInFlight(endpoint string) {
+	c.inFlightMu.Lock()
+	limiter := c.inFlight[endpoint]
+	c.inFlightMu.Unlock()
+	if limiter == nil {
+		return
+	}
 	select {
-	case <-c.inFlight:
+	case <-limiter:
 	default:
 	}
 }

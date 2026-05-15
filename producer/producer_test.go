@@ -72,6 +72,98 @@ func TestSendAsyncFlushBatchesRecords(t *testing.T) {
 	}
 }
 
+func TestIdempotentProducerInitializesIdentityAndSequencesBatches(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	endpoint, err := transport.ParseEndpoint(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseEndpoint() error = %v", err)
+	}
+	serverDone := make(chan error, 1)
+	go serveIdempotentProducerBroker(t, listener, endpoint, serverDone)
+
+	pool := transport.NewPool(transport.DefaultMaxFrameLength)
+	defer pool.Close()
+	protocolClient := protocolclient.New(pool, codec.DefaultRegistry(), "producer-test")
+	metadataManager := imetadata.New(protocolClient, []transport.Endpoint{endpoint})
+	client := NewWithOptions(protocolClient, metadataManager, Options{
+		Idempotent:  true,
+		BatchSize:   1,
+		Linger:      time.Hour,
+		QueueSize:   10,
+		MaxInFlight: 2,
+	})
+	defer client.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := client.Send(ctx, Record{Topic: "orders", Value: []byte("a")})
+	if err != nil {
+		t.Fatalf("Send(first) error = %v", err)
+	}
+	second, err := client.Send(ctx, Record{Topic: "orders", Value: []byte("b")})
+	if err != nil {
+		t.Fatalf("Send(second) error = %v", err)
+	}
+	if first.Offset != 42 || second.Offset != 42 {
+		t.Fatalf("offsets = %d/%d, want both acknowledged base offset 42", first.Offset, second.Offset)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestTransactionAPIsSendControlRequests(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	endpoint, err := transport.ParseEndpoint(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseEndpoint() error = %v", err)
+	}
+	serverDone := make(chan error, 1)
+	go serveTransactionBroker(t, listener, serverDone)
+
+	pool := transport.NewPool(transport.DefaultMaxFrameLength)
+	defer pool.Close()
+	protocolClient := protocolclient.New(pool, codec.DefaultRegistry(), "producer-test")
+	metadataManager := imetadata.New(protocolClient, []transport.Endpoint{endpoint})
+	client := NewWithOptions(protocolClient, metadataManager, Options{TransactionalID: "txn-a"})
+	defer client.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	metadata, err := client.InitProducerID(ctx)
+	if err != nil {
+		t.Fatalf("InitProducerID() error = %v", err)
+	}
+	if metadata.ProducerID != 123 || metadata.ProducerEpoch != 2 {
+		t.Fatalf("InitProducerID() = %+v", metadata)
+	}
+	begin, err := client.BeginTransaction(ctx)
+	if err != nil {
+		t.Fatalf("BeginTransaction() error = %v", err)
+	}
+	if begin.TransactionState == nil || *begin.TransactionState != "ONGOING" {
+		t.Fatalf("BeginTransaction() = %+v", begin)
+	}
+	commit, err := client.CommitTransaction(ctx)
+	if err != nil {
+		t.Fatalf("CommitTransaction() error = %v", err)
+	}
+	if commit.TransactionState == nil || *commit.TransactionState != "COMMITTED" {
+		t.Fatalf("CommitTransaction() = %+v", commit)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
 func TestKeyHashPartitionerIsStable(t *testing.T) {
 	partitions := []int32{0, 1, 2, 3}
 	record := Record{Topic: "orders", Key: []byte("same-key")}
@@ -87,6 +179,21 @@ func TestKeyHashPartitionerIsStable(t *testing.T) {
 		if got != first {
 			t.Fatalf("partition = %d, want stable %d", got, first)
 		}
+	}
+}
+
+func TestProducerCloseRejectsAsyncEnqueueAndFlushesQueuedFutures(t *testing.T) {
+	client := NewWithOptions(nil, nil, Options{QueueSize: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := client.Flush(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Flush() error = %v, want ErrClosed", err)
+	}
+	if _, err := client.SendAsync(ctx, Record{Topic: "orders", Value: []byte("a")}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("SendAsync() error = %v, want ErrClosed", err)
 	}
 }
 
@@ -162,6 +269,139 @@ func serveProducerBroker(t *testing.T, listener net.Listener, endpoint transport
 		return
 	}
 	done <- nil
+}
+
+func serveIdempotentProducerBroker(t *testing.T, listener net.Listener, endpoint transport.Endpoint, done chan<- error) {
+	t.Helper()
+	conn, err := listener.Accept()
+	if err != nil {
+		done <- err
+		return
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		done <- err
+		return
+	}
+	if err := expectMetadataRequest(conn, endpoint); err != nil {
+		done <- err
+		return
+	}
+	frame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		done <- err
+		return
+	}
+	apiKey, correlationID, _, err := producerRequest(frame)
+	if err != nil {
+		done <- err
+		return
+	}
+	if apiKey != protocol.ApiKeyInitProducerID {
+		done <- &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected init producer id request"}
+		return
+	}
+	if _, err := conn.Write(initProducerIDResponseFrame(correlationID, 123, 2)); err != nil {
+		done <- err
+		return
+	}
+	if err := expectProduceSequence(conn, 0); err != nil {
+		done <- err
+		return
+	}
+	if err := expectProduceSequence(conn, 1); err != nil {
+		done <- err
+		return
+	}
+	done <- nil
+}
+
+func serveTransactionBroker(t *testing.T, listener net.Listener, done chan<- error) {
+	t.Helper()
+	conn, err := listener.Accept()
+	if err != nil {
+		done <- err
+		return
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		done <- err
+		return
+	}
+	if err := expectAPIKey(conn, protocol.ApiKeyInitProducerID, func(correlationID int32) []byte {
+		return initProducerIDResponseFrame(correlationID, 123, 2)
+	}); err != nil {
+		done <- err
+		return
+	}
+	if err := expectAPIKey(conn, protocol.ApiKeyBeginTxn, func(correlationID int32) []byte {
+		return transactionResponseFrame(correlationID, 123, 2, "ONGOING")
+	}); err != nil {
+		done <- err
+		return
+	}
+	if err := expectAPIKey(conn, protocol.ApiKeyEndTxn, func(correlationID int32) []byte {
+		return transactionResponseFrame(correlationID, 123, 2, "COMMITTED")
+	}); err != nil {
+		done <- err
+		return
+	}
+	done <- nil
+}
+
+func expectAPIKey(conn net.Conn, want protocol.ApiKey, response func(int32) []byte) error {
+	frame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		return err
+	}
+	apiKey, correlationID, _, err := producerRequest(frame)
+	if err != nil {
+		return err
+	}
+	if apiKey != want {
+		return &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "unexpected api key"}
+	}
+	_, err = conn.Write(response(correlationID))
+	return err
+}
+
+func expectMetadataRequest(conn net.Conn, endpoint transport.Endpoint) error {
+	metadataFrame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		return err
+	}
+	apiKey, correlationID, _, err := producerRequest(metadataFrame)
+	if err != nil {
+		return err
+	}
+	if apiKey != protocol.ApiKeyMetadata {
+		return &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected metadata request"}
+	}
+	_, err = conn.Write(producerMetadataResponseFrame(correlationID, endpoint))
+	return err
+}
+
+func expectProduceSequence(conn net.Conn, baseSequence int32) error {
+	produceFrame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		return err
+	}
+	apiKey, correlationID, body, err := producerRequest(produceFrame)
+	if err != nil {
+		return err
+	}
+	if apiKey != protocol.ApiKeyProduce {
+		return &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected produce request"}
+	}
+	producerID, producerEpoch, sequence, err := produceBatchIdentity(body)
+	if err != nil {
+		return err
+	}
+	if producerID != 123 || producerEpoch != 2 || sequence != baseSequence {
+		return &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "unexpected idempotent batch identity"}
+	}
+	_, err = conn.Write(produceResponseFrame(correlationID))
+	return err
 }
 
 func producerRequest(frame []byte) (protocol.ApiKey, int32, []byte, error) {
@@ -261,6 +501,51 @@ func produceRecordCount(body []byte) (int, error) {
 	return total, nil
 }
 
+func produceBatchIdentity(body []byte) (int64, int16, int32, error) {
+	reader := codec.NewReader(body)
+	if _, err := reader.ReadNullableString(); err != nil {
+		return 0, 0, 0, err
+	}
+	if _, err := reader.ReadInt16(); err != nil {
+		return 0, 0, 0, err
+	}
+	if _, err := reader.ReadInt32(); err != nil {
+		return 0, 0, 0, err
+	}
+	topicCount, err := reader.ReadArrayLen()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if topicCount != 1 {
+		return 0, 0, 0, &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected one topic"}
+	}
+	if _, err := reader.ReadNullableString(); err != nil {
+		return 0, 0, 0, err
+	}
+	partitionCount, err := reader.ReadArrayLen()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if partitionCount != 1 {
+		return 0, 0, 0, &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected one partition"}
+	}
+	if _, err := reader.ReadInt32(); err != nil {
+		return 0, 0, 0, err
+	}
+	records, err := reader.ReadBytes()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	batches, err := codec.DecodeRecordBatchSet(records)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if len(batches) != 1 {
+		return 0, 0, 0, &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected one record batch"}
+	}
+	return batches[0].ProducerID, batches[0].ProducerEpoch, batches[0].BaseSequence, nil
+}
+
 func producerMetadataResponseFrame(correlationID int32, endpoint transport.Endpoint) []byte {
 	return producerResponseFrame(correlationID, func(writer *codec.Writer) {
 		clusterID := "cluster-a"
@@ -286,6 +571,23 @@ func producerMetadataResponseFrame(correlationID int32, endpoint transport.Endpo
 		writer.WriteInt32Array([]int32{})
 		writer.WriteInt32(0)
 		writer.WriteInt32(0)
+	})
+}
+
+func initProducerIDResponseFrame(correlationID int32, producerID int64, producerEpoch int16) []byte {
+	return producerResponseFrame(correlationID, func(writer *codec.Writer) {
+		writer.WriteInt16(protocol.ErrorCodeNone.Code())
+		writer.WriteInt64(producerID)
+		writer.WriteInt16(producerEpoch)
+	})
+}
+
+func transactionResponseFrame(correlationID int32, producerID int64, producerEpoch int16, state string) []byte {
+	return producerResponseFrame(correlationID, func(writer *codec.Writer) {
+		writer.WriteInt16(protocol.ErrorCodeNone.Code())
+		writer.WriteInt64(producerID)
+		writer.WriteInt16(producerEpoch)
+		writer.WriteNullableString(&state)
 	})
 }
 

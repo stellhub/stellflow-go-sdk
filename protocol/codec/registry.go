@@ -62,6 +62,12 @@ func DefaultRegistry() *Registry {
 	registry.RegisterResponseDecoder(protocol.ApiKeyJoinGroup, protocol.DefaultAPIVersion, decodeJoinGroupResponseBodyAny)
 	registry.RegisterRequestEncoder(protocol.ApiKeySyncGroup, protocol.DefaultAPIVersion, encodeSyncGroupRequestBodyAny)
 	registry.RegisterResponseDecoder(protocol.ApiKeySyncGroup, protocol.DefaultAPIVersion, decodeSyncGroupResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeyInitProducerID, protocol.DefaultAPIVersion, encodeInitProducerIDRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeyInitProducerID, protocol.DefaultAPIVersion, decodeInitProducerIDResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeyBeginTxn, protocol.DefaultAPIVersion, encodeBeginTxnRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeyBeginTxn, protocol.DefaultAPIVersion, decodeTransactionResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeyEndTxn, protocol.DefaultAPIVersion, encodeEndTxnRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeyEndTxn, protocol.DefaultAPIVersion, decodeTransactionResponseBodyAny)
 	return registry
 }
 
