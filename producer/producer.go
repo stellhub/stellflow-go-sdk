@@ -223,7 +223,20 @@ func validateRecord(record Record) error {
 func (c *Client) selectPartition(ctx context.Context, record Record) (int32, error) {
 	partition := record.Partition
 	if partition != 0 && partition != NoPartition {
+		if err := c.ensureTopic(ctx, record.Topic, partition+1); err != nil {
+			return 0, err
+		}
 		return partition, nil
+	}
+	if err := c.ensureTopic(ctx, record.Topic, c.options.AutoCreateTopicPartitionCount); err != nil {
+		return 0, err
+	}
+	return c.selectPartitionFromMetadata(ctx, record)
+}
+
+func (c *Client) selectPartitionFromMetadata(ctx context.Context, record Record) (int32, error) {
+	if c.metadata == nil {
+		return 0, errors.New("producer requires metadata manager to select partition")
 	}
 	partitions, err := c.metadata.PartitionIDs(ctx, record.Topic)
 	if err != nil {
@@ -240,6 +253,66 @@ func (c *Client) selectPartition(ctx context.Context, record Record) (int32, err
 	c.roundRobin++
 	c.mu.Unlock()
 	return partitions[index%len(partitions)], nil
+}
+
+func (c *Client) ensureTopic(ctx context.Context, topic string, partitionCount int32) error {
+	if c.metadata == nil || c.options.DisableAutoCreateTopics {
+		return nil
+	}
+	partitions, err := c.metadata.PartitionIDs(ctx, topic)
+	if err == nil && len(partitions) > 0 {
+		return nil
+	}
+	if err != nil && !imetadata.IsMissingPartitions(err) {
+		return err
+	}
+	if partitionCount <= 0 {
+		partitionCount = c.options.AutoCreateTopicPartitionCount
+	}
+	if partitionCount <= 0 {
+		partitionCount = 1
+	}
+	if err := c.createTopic(ctx, topic, partitionCount); err != nil {
+		return err
+	}
+	_, err = c.metadata.Refresh(ctx, []string{topic})
+	return err
+}
+
+func (c *Client) createTopic(ctx context.Context, topic string, partitionCount int32) error {
+	bootstrap, err := c.metadata.BootstrapEndpoint()
+	if err != nil {
+		return err
+	}
+	body := message.TopicAdminRequestBody{
+		Topic:          &topic,
+		PartitionCount: partitionCount,
+		Partition:      -1,
+		LeaderID:       -1,
+		LeaderEpoch:    -1,
+	}
+	response, err := c.protocol.Send(ctx, bootstrap, protocol.ApiKeyCreateTopic, protocol.DefaultAPIVersion, body)
+	if err != nil {
+		return err
+	}
+	typed, ok := response.Body.(message.TopicAdminResponseBody)
+	if !ok {
+		return errors.New("unexpected CreateTopic response body")
+	}
+	if typed.Topic == nil || *typed.Topic != topic {
+		return errors.New("create topic response mismatch")
+	}
+	for _, partition := range typed.Partitions {
+		if partition.ErrorCode != protocol.ErrorCodeNone {
+			return &protocol.ClientError{Code: partition.ErrorCode, Message: "create topic failed"}
+		}
+	}
+	c.metadata.Invalidate(topic)
+	c.logger.Info(ctx, "producer auto-created topic",
+		observability.String("topic", topic),
+		observability.Int("partition_count", len(typed.Partitions)),
+	)
+	return nil
 }
 
 func (c *Client) produceRecords(ctx context.Context, topic string, partition int32, records []Record) ([]Metadata, error) {

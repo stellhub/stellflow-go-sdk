@@ -21,24 +21,26 @@ const (
 
 // Options configures producer batching and partitioning.
 type Options struct {
-	Acks             int16
-	TimeoutMs        int32
-	DeliveryTimeout  time.Duration
-	RequestTimeout   time.Duration
-	RetryMaxAttempts int
-	RetryBackoff     time.Duration
-	MaxInFlight      int
-	Ordering         OrderingStrategy
-	BatchSize        int
-	BatchBytes       int
-	Linger           time.Duration
-	QueueSize        int
-	Partitioner      Partitioner
-	Idempotent       bool
-	ProducerID       int64
-	ProducerEpoch    int16
-	TransactionalID  string
-	Observability    observability.Options
+	Acks                          int16
+	TimeoutMs                     int32
+	DeliveryTimeout               time.Duration
+	RequestTimeout                time.Duration
+	RetryMaxAttempts              int
+	RetryBackoff                  time.Duration
+	MaxInFlight                   int
+	Ordering                      OrderingStrategy
+	BatchSize                     int
+	BatchBytes                    int
+	Linger                        time.Duration
+	QueueSize                     int
+	Partitioner                   Partitioner
+	DisableAutoCreateTopics       bool
+	AutoCreateTopicPartitionCount int32
+	Idempotent                    bool
+	ProducerID                    int64
+	ProducerEpoch                 int16
+	TransactionalID               string
+	Observability                 observability.Options
 }
 
 func normalizeOptions(options Options) Options {
@@ -84,6 +86,9 @@ func normalizeOptions(options Options) Options {
 	}
 	if options.QueueSize <= 0 {
 		options.QueueSize = 1024
+	}
+	if options.AutoCreateTopicPartitionCount <= 0 {
+		options.AutoCreateTopicPartitionCount = 2
 	}
 	if !options.Idempotent {
 		options.ProducerID = -1

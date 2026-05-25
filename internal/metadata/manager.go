@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -20,6 +21,21 @@ import (
 type TopicPartition struct {
 	Topic     string
 	Partition int32
+}
+
+// MissingPartitionsError indicates that metadata has no partition routes for topic.
+type MissingPartitionsError struct {
+	Topic string
+}
+
+func (e *MissingPartitionsError) Error() string {
+	return fmt.Sprintf("missing partitions for topic %s", e.Topic)
+}
+
+// IsMissingPartitions reports whether err means metadata has no partitions for topic.
+func IsMissingPartitions(err error) bool {
+	var missing *MissingPartitionsError
+	return errors.As(err, &missing)
 }
 
 // PartitionRoute contains the current leader route for one partition.
@@ -216,7 +232,7 @@ func (m *Manager) PartitionIDs(ctx context.Context, topic string) ([]int32, erro
 	defer m.mu.RUnlock()
 	ids = m.partitionIDsLocked(topic)
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("missing partitions for topic %s", topic)
+		return nil, &MissingPartitionsError{Topic: topic}
 	}
 	return ids, nil
 }
@@ -226,6 +242,17 @@ func (m *Manager) Snapshot() message.MetadataResponseBody {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.response
+}
+
+// Invalidate removes cached routes for topic.
+func (m *Manager) Invalidate(topic string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key := range m.routes {
+		if key.Topic == topic {
+			delete(m.routes, key)
+		}
+	}
 }
 
 func (m *Manager) partitionIDsLocked(topic string) []int32 {

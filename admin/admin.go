@@ -3,6 +3,8 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 
 	imetadata "github.com/stellhub/stellflow-go-sdk/internal/metadata"
 	"github.com/stellhub/stellflow-go-sdk/internal/protocolclient"
@@ -84,6 +86,20 @@ type ClusterDescription struct {
 	ClusterAuthorizedOperations int32
 }
 
+// CreateTopicResult describes a topic creation result.
+type CreateTopicResult struct {
+	Topic      string
+	Created    bool
+	Partitions []CreateTopicPartitionResult
+}
+
+// CreateTopicPartitionResult describes one created topic partition.
+type CreateTopicPartitionResult struct {
+	Partition   int32
+	ErrorCode   protocol.ErrorCode
+	LeaderEpoch int32
+}
+
 // DescribeCluster returns cluster metadata.
 func (c *Client) DescribeCluster(ctx context.Context) (ClusterDescription, error) {
 	response, err := c.Metadata(ctx, nil)
@@ -96,6 +112,80 @@ func (c *Client) DescribeCluster(ctx context.Context) (ClusterDescription, error
 		Brokers:                     response.Brokers,
 		ClusterAuthorizedOperations: response.ClusterAuthorizedOperations,
 	}, nil
+}
+
+// CreateTopic creates topic with partitionCount partitions.
+func (c *Client) CreateTopic(ctx context.Context, topic string, partitionCount int32) (CreateTopicResult, error) {
+	ctx, span := c.tracer.Start(ctx, "stellflow.admin.create_topic",
+		trace.WithAttributes(
+			attribute.String("stellflow.topic", topic),
+			attribute.Int("stellflow.partition_count", int(partitionCount)),
+		),
+	)
+	defer span.End()
+	if err := validateTopicCreation(topic, partitionCount); err != nil {
+		c.recordError(ctx, span, "admin create topic validation failed", err)
+		return CreateTopicResult{}, err
+	}
+	bootstrap, err := c.metadata.BootstrapEndpoint()
+	if err != nil {
+		c.recordError(ctx, span, "admin create topic failed", err)
+		return CreateTopicResult{}, err
+	}
+	body := message.TopicAdminRequestBody{
+		Topic:          &topic,
+		PartitionCount: partitionCount,
+		Partition:      -1,
+		LeaderID:       -1,
+		LeaderEpoch:    -1,
+	}
+	response, err := c.protocol.Send(ctx, bootstrap, protocol.ApiKeyCreateTopic, protocol.DefaultAPIVersion, body)
+	if err != nil {
+		c.recordError(ctx, span, "admin create topic failed", err)
+		return CreateTopicResult{}, err
+	}
+	typed, ok := response.Body.(message.TopicAdminResponseBody)
+	if !ok {
+		err := errors.New("unexpected CreateTopic response body")
+		c.recordError(ctx, span, "admin create topic response decode failed", err)
+		return CreateTopicResult{}, err
+	}
+	result, err := createTopicResultFromResponse(topic, typed, true)
+	if err != nil {
+		c.recordError(ctx, span, "admin create topic response validation failed", err)
+		return CreateTopicResult{}, err
+	}
+	if err := requireSuccessfulCreateTopicResult(result); err != nil {
+		c.recordError(ctx, span, "admin create topic failed", err)
+		return CreateTopicResult{}, err
+	}
+	c.metadata.Invalidate(topic)
+	c.logger.Info(ctx, "admin create topic completed",
+		observability.String("topic", topic),
+		observability.Int("partition_count", len(result.Partitions)),
+	)
+	return result, nil
+}
+
+// CreateTopicIfAbsent creates topic only when metadata does not report an existing topic.
+func (c *Client) CreateTopicIfAbsent(ctx context.Context, topic string, partitionCount int32) (CreateTopicResult, error) {
+	if err := validateTopicCreation(topic, partitionCount); err != nil {
+		return CreateTopicResult{}, err
+	}
+	response, err := c.Metadata(ctx, []string{topic})
+	if err != nil {
+		return CreateTopicResult{}, err
+	}
+	for _, topicResponse := range response.Topics {
+		if topicResponse.Topic == nil || *topicResponse.Topic != topic {
+			continue
+		}
+		if topicResponse.ErrorCode == protocol.ErrorCodeNone {
+			return existingCreateTopicResult(topicResponse), nil
+		}
+		break
+	}
+	return c.CreateTopic(ctx, topic, partitionCount)
 }
 
 // ListOffsetsRequest is one offset query.
@@ -206,6 +296,59 @@ func shouldRefreshRoute(ctx context.Context, err error) bool {
 	}
 	var clientErr *protocol.ClientError
 	return !errors.As(err, &clientErr)
+}
+
+func validateTopicCreation(topic string, partitionCount int32) error {
+	if strings.TrimSpace(topic) == "" {
+		return errors.New("topic must not be blank")
+	}
+	if partitionCount <= 0 {
+		return errors.New("partitionCount must be positive")
+	}
+	return nil
+}
+
+func createTopicResultFromResponse(topic string, response message.TopicAdminResponseBody, created bool) (CreateTopicResult, error) {
+	if response.Topic == nil {
+		return CreateTopicResult{}, errors.New("create topic response missing topic")
+	}
+	if *response.Topic != topic {
+		return CreateTopicResult{}, fmt.Errorf("create topic response mismatch: %s", *response.Topic)
+	}
+	partitions := make([]CreateTopicPartitionResult, 0, len(response.Partitions))
+	for _, partition := range response.Partitions {
+		partitions = append(partitions, CreateTopicPartitionResult{
+			Partition:   partition.Partition,
+			ErrorCode:   partition.ErrorCode,
+			LeaderEpoch: partition.LeaderEpoch,
+		})
+	}
+	return CreateTopicResult{Topic: topic, Created: created, Partitions: partitions}, nil
+}
+
+func existingCreateTopicResult(topic message.MetadataTopicResponse) CreateTopicResult {
+	name := ""
+	if topic.Topic != nil {
+		name = *topic.Topic
+	}
+	partitions := make([]CreateTopicPartitionResult, 0, len(topic.Partitions))
+	for _, partition := range topic.Partitions {
+		partitions = append(partitions, CreateTopicPartitionResult{
+			Partition:   partition.Partition,
+			ErrorCode:   partition.ErrorCode,
+			LeaderEpoch: partition.LeaderEpoch,
+		})
+	}
+	return CreateTopicResult{Topic: name, Created: false, Partitions: partitions}
+}
+
+func requireSuccessfulCreateTopicResult(result CreateTopicResult) error {
+	for _, partition := range result.Partitions {
+		if partition.ErrorCode != protocol.ErrorCodeNone {
+			return &protocol.ClientError{Code: partition.ErrorCode, Message: "create topic failed"}
+		}
+	}
+	return nil
 }
 
 func (c *Client) recordError(ctx context.Context, span trace.Span, msg string, err error) {

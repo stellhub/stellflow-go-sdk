@@ -69,6 +69,8 @@ func DefaultRegistry() *Registry {
 	registry.RegisterResponseDecoder(protocol.ApiKeyBeginTxn, protocol.DefaultAPIVersion, decodeTransactionResponseBodyAny)
 	registry.RegisterRequestEncoder(protocol.ApiKeyEndTxn, protocol.DefaultAPIVersion, encodeEndTxnRequestBodyAny)
 	registry.RegisterResponseDecoder(protocol.ApiKeyEndTxn, protocol.DefaultAPIVersion, decodeTransactionResponseBodyAny)
+	registry.RegisterRequestEncoder(protocol.ApiKeyCreateTopic, protocol.DefaultAPIVersion, encodeTopicAdminRequestBodyAny)
+	registry.RegisterResponseDecoder(protocol.ApiKeyCreateTopic, protocol.DefaultAPIVersion, decodeTopicAdminResponseBodyAny)
 	return registry
 }
 

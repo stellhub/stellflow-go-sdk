@@ -72,6 +72,70 @@ func TestSendAsyncFlushBatchesRecords(t *testing.T) {
 	}
 }
 
+func TestProducerAutoCreatesMissingTopicBeforeSend(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	endpoint, err := transport.ParseEndpoint(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseEndpoint() error = %v", err)
+	}
+	serverDone := make(chan error, 1)
+	go serveAutoCreateProducerBroker(t, listener, endpoint, serverDone)
+
+	pool := transport.NewPool(transport.DefaultMaxFrameLength)
+	defer pool.Close()
+	protocolClient := protocolclient.New(pool, codec.DefaultRegistry(), "producer-test")
+	metadataManager := imetadata.New(protocolClient, []transport.Endpoint{endpoint})
+	client := NewWithOptions(protocolClient, metadataManager, Options{})
+	defer client.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	metadata, err := client.Send(ctx, Record{Topic: "orders", Value: []byte("created")})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if metadata.Topic != "orders" || metadata.Partition != 0 || metadata.Offset != 42 {
+		t.Fatalf("metadata = %+v", metadata)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestProducerCanDisableAutoCreateTopics(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	endpoint, err := transport.ParseEndpoint(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseEndpoint() error = %v", err)
+	}
+	serverDone := make(chan error, 1)
+	go serveMissingTopicMetadataBroker(t, listener, serverDone)
+
+	pool := transport.NewPool(transport.DefaultMaxFrameLength)
+	defer pool.Close()
+	protocolClient := protocolclient.New(pool, codec.DefaultRegistry(), "producer-test")
+	metadataManager := imetadata.New(protocolClient, []transport.Endpoint{endpoint})
+	client := NewWithOptions(protocolClient, metadataManager, Options{DisableAutoCreateTopics: true})
+	defer client.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Send(ctx, Record{Topic: "orders", Value: []byte("missing")}); !imetadata.IsMissingPartitions(err) {
+		t.Fatalf("Send() error = %v, want missing partitions", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
 func TestIdempotentProducerInitializesIdentityAndSequencesBatches(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -275,6 +339,101 @@ func serveProducerBroker(t *testing.T, listener net.Listener, endpoint transport
 	done <- nil
 }
 
+func serveAutoCreateProducerBroker(t *testing.T, listener net.Listener, endpoint transport.Endpoint, done chan<- error) {
+	t.Helper()
+	conn, err := listener.Accept()
+	if err != nil {
+		done <- err
+		return
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		done <- err
+		return
+	}
+	if err := expectProducerAPIVersionsRequest(conn); err != nil {
+		done <- err
+		return
+	}
+	if err := expectMetadataRequestWithResponse(conn, missingTopicMetadataResponseFrame); err != nil {
+		done <- err
+		return
+	}
+	frame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		done <- err
+		return
+	}
+	apiKey, correlationID, body, err := producerRequest(frame)
+	if err != nil {
+		done <- err
+		return
+	}
+	if apiKey != protocol.ApiKeyCreateTopic {
+		done <- &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected create topic request"}
+		return
+	}
+	topic, partitionCount, err := createTopicRequest(body)
+	if err != nil {
+		done <- err
+		return
+	}
+	if topic != "orders" || partitionCount != 2 {
+		done <- &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "unexpected create topic request"}
+		return
+	}
+	if _, err := conn.Write(createTopicResponseFrame(correlationID, topic, partitionCount)); err != nil {
+		done <- err
+		return
+	}
+	if err := expectMetadataRequest(conn, endpoint); err != nil {
+		done <- err
+		return
+	}
+	frame, err = transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
+	if err != nil {
+		done <- err
+		return
+	}
+	apiKey, correlationID, _, err = producerRequest(frame)
+	if err != nil {
+		done <- err
+		return
+	}
+	if apiKey != protocol.ApiKeyProduce {
+		done <- &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected produce request"}
+		return
+	}
+	if _, err := conn.Write(produceResponseFrame(correlationID)); err != nil {
+		done <- err
+		return
+	}
+	done <- nil
+}
+
+func serveMissingTopicMetadataBroker(t *testing.T, listener net.Listener, done chan<- error) {
+	t.Helper()
+	conn, err := listener.Accept()
+	if err != nil {
+		done <- err
+		return
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		done <- err
+		return
+	}
+	if err := expectProducerAPIVersionsRequest(conn); err != nil {
+		done <- err
+		return
+	}
+	if err := expectMetadataRequestWithResponse(conn, missingTopicMetadataResponseFrame); err != nil {
+		done <- err
+		return
+	}
+	done <- nil
+}
+
 func serveIdempotentProducerBroker(t *testing.T, listener net.Listener, endpoint transport.Endpoint, done chan<- error) {
 	t.Helper()
 	conn, err := listener.Accept()
@@ -394,6 +553,12 @@ func expectProducerAPIVersionsRequest(conn net.Conn) error {
 }
 
 func expectMetadataRequest(conn net.Conn, endpoint transport.Endpoint) error {
+	return expectMetadataRequestWithResponse(conn, func(correlationID int32) []byte {
+		return producerMetadataResponseFrame(correlationID, endpoint)
+	})
+}
+
+func expectMetadataRequestWithResponse(conn net.Conn, response func(int32) []byte) error {
 	metadataFrame, err := transport.ReadFrame(conn, transport.DefaultMaxFrameLength)
 	if err != nil {
 		return err
@@ -405,8 +570,24 @@ func expectMetadataRequest(conn net.Conn, endpoint transport.Endpoint) error {
 	if apiKey != protocol.ApiKeyMetadata {
 		return &protocol.ClientError{Code: protocol.ErrorCodeInvalidRequest, Message: "expected metadata request"}
 	}
-	_, err = conn.Write(producerMetadataResponseFrame(correlationID, endpoint))
+	_, err = conn.Write(response(correlationID))
 	return err
+}
+
+func createTopicRequest(body []byte) (string, int32, error) {
+	reader := codec.NewReader(body)
+	topic, err := reader.ReadNullableString()
+	if err != nil {
+		return "", 0, err
+	}
+	partitionCount, err := reader.ReadInt32()
+	if err != nil {
+		return "", 0, err
+	}
+	if topic == nil {
+		return "", partitionCount, nil
+	}
+	return *topic, partitionCount, nil
 }
 
 func expectProduceSequence(conn net.Conn, baseSequence int32) error {
@@ -602,15 +783,45 @@ func producerMetadataResponseFrame(correlationID int32, endpoint transport.Endpo
 	})
 }
 
+func missingTopicMetadataResponseFrame(correlationID int32) []byte {
+	return producerResponseFrame(correlationID, func(writer *codec.Writer) {
+		clusterID := "cluster-a"
+		topic := "orders"
+		writer.WriteNullableString(&clusterID)
+		writer.WriteInt32(1)
+		writer.WriteArrayLen(0)
+		writer.WriteArrayLen(1)
+		writer.WriteInt16(protocol.ErrorCodeUnknownTopicOrPartition.Code())
+		writer.WriteNullableString(&topic)
+		writer.WriteBool(false)
+		writer.WriteArrayLen(0)
+		writer.WriteInt32(0)
+		writer.WriteInt32(0)
+	})
+}
+
+func createTopicResponseFrame(correlationID int32, topic string, partitionCount int32) []byte {
+	return producerResponseFrame(correlationID, func(writer *codec.Writer) {
+		writer.WriteNullableString(&topic)
+		writer.WriteArrayLen(int(partitionCount))
+		for partition := int32(0); partition < partitionCount; partition++ {
+			writer.WriteInt32(partition)
+			writer.WriteInt16(protocol.ErrorCodeNone.Code())
+			writer.WriteInt32(7)
+		}
+	})
+}
+
 func producerAPIVersionsResponseFrame(correlationID int32) []byte {
 	return producerResponseFrame(correlationID, func(writer *codec.Writer) {
-		writer.WriteArrayLen(6)
+		writer.WriteArrayLen(7)
 		writeProducerAPIVersionRange(writer, protocol.ApiKeyAPIVersions)
 		writeProducerAPIVersionRange(writer, protocol.ApiKeyMetadata)
 		writeProducerAPIVersionRange(writer, protocol.ApiKeyProduce)
 		writeProducerAPIVersionRange(writer, protocol.ApiKeyInitProducerID)
 		writeProducerAPIVersionRange(writer, protocol.ApiKeyBeginTxn)
 		writeProducerAPIVersionRange(writer, protocol.ApiKeyEndTxn)
+		writeProducerAPIVersionRange(writer, protocol.ApiKeyCreateTopic)
 		name := "stellflow-test-broker"
 		writer.WriteNullableString(&name)
 		writer.WriteNullableString(nil)
